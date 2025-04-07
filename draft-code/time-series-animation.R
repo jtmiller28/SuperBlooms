@@ -58,8 +58,8 @@ map_plot <- ggplot() +
     name = "log(N obs + 1)"
   ) +
   labs(
-    title = "Weekly Aggregated Observation Intensity per 50km grid cell",
-    subtitle = "Day of Year: {frame_time}", 
+    title = "2019 Weekly Aggregated Observation Intensity \n per 50km grid cell",
+    subtitle = "Week Bin: {frame_time}", 
     caption = "iNaturalist Flowering Data annotated by PhenoVision", 
     x = NULL, y = NULL
   ) +
@@ -68,8 +68,43 @@ map_plot <- ggplot() +
     plot.subtitle = element_text(size = 14),
     legend.position = "right"
   ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
   transition_time(week_bin)
 
 # create an animation a save. 
-map_anim <- animate(map_plot, nframes = 366, fps = 5, units = "in", width = 8, height = 8, res = 100, renderer = magick_renderer())
+map_anim <- animate(map_plot, nframes = 52, fps = 1, units = "in", width = 8, height = 8, res = 100, renderer = magick_renderer())
 anim_save("/home/jt-miller/Gurlab/SuperBlooms/figures/hex_obs_by_wk2019.gif", animation = map_anim)
+
+# create an alternative field to transition by (as to keep the overall histogram static in image)
+week_df <- data.frame(week_step_bin = hex_50_wk_hist_summary$week_bin)
+# create a hist plot 
+hist_plot <- ggplot(hex_50_wk_hist_summary, mapping = aes(x = week_bin, y = total_obs)) + 
+  geom_col(fill = "steelblue", color = "black", width = 1) +
+  geom_vline(week_df, mapping = aes(xintercept = week_step_bin), color = "red", linewidth = 1) +
+  scale_x_continuous(breaks = seq(1, 52, by = 1)) +
+  labs(
+    x = "Week bin", 
+    y = "Number of Observations", 
+    title = "2019 Flowering Observations Across the Year"
+  ) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  view_static() +
+  transition_time(week_step_bin)
+
+hist_anim <- animate(hist_plot, nframes = 52, fps = 1, units = "in", width = 8, height = 8, res = 100, renderer = magick_renderer())
+anim_save("/home/jt-miller/Gurlab/SuperBlooms/figures/hist_obs_by_wk2019.gif", animation = hist_anim)
+
+library(magick)
+week_df <- filter(week_df, !is.na(week_step_bin))
+# combine gifs into an object
+comb_gif <- magick::image_append(c(map_anim[1], hist_anim[1]))
+
+for(i in 2:max(week_df$week_step_bin)){
+  combined <- image_append((c(map_anim[i], hist_anim[i])))
+  comb_gif <- c(comb_gif, combined)
+}
+
+anim_save("/home/jt-miller/Gurlab/SuperBlooms/figures/hist-hex-obs-by-wk2019.gif", comb_gif )
