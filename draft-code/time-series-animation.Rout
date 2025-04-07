@@ -1,0 +1,128 @@
+
+R version 4.1.2 (2021-11-01) -- "Bird Hippie"
+Copyright (C) 2021 The R Foundation for Statistical Computing
+Platform: x86_64-pc-linux-gnu (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> ### Time Series Animation
+> ### Project: SuperBlooms
+> ### Author: JT Miller
+> ### Date: 04-07-2025
+> 
+> # A script to build gifs showing how flowering is observed across superbloom years within our study region. 
+> 
+> # load libraries
+> library(ggplot2)
+> library(data.table)
+> library(tidyverse)
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.1
+✔ lubridate 1.9.4     ✔ tibble    3.2.1
+✔ purrr     1.0.2     ✔ tidyr     1.3.1
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ dplyr::between()     masks data.table::between()
+✖ dplyr::filter()      masks stats::filter()
+✖ dplyr::first()       masks data.table::first()
+✖ lubridate::hour()    masks data.table::hour()
+✖ lubridate::isoweek() masks data.table::isoweek()
+✖ dplyr::lag()         masks stats::lag()
+✖ dplyr::last()        masks data.table::last()
+✖ lubridate::mday()    masks data.table::mday()
+✖ lubridate::minute()  masks data.table::minute()
+✖ lubridate::month()   masks data.table::month()
+✖ lubridate::quarter() masks data.table::quarter()
+✖ lubridate::second()  masks data.table::second()
+✖ purrr::transpose()   masks data.table::transpose()
+✖ lubridate::wday()    masks data.table::wday()
+✖ lubridate::week()    masks data.table::week()
+✖ lubridate::yday()    masks data.table::yday()
+✖ lubridate::year()    masks data.table::year()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+> library(sf)
+Linking to GEOS 3.10.2, GDAL 3.4.1, PROJ 8.2.1; sf_use_s2() is TRUE
+> library(RColorBrewer)
+> library(gganimate)
+> 
+> # load the subsetted data
+> flower_data <- fread("/home/jt-miller/Gurlab/SuperBlooms/data/processed/desert-observations-hexed.csv")
+> 
+> # filter data for a known superbloom year
+> flower_data_sb <- flower_data %>% 
++   filter(year == 2019)
+> 
+> # load in gridded map of study region 
+> hex_50km <- read_rds("/home/jt-miller/Gurlab/SuperBlooms/data/processed/50km-hexed-map.rds")
+> 
+> # bin data by hexcell, and doy. Then summarize the number of obs & unique sp occuring within those bins. 
+> doy_hex50_bin_summary <- flower_data_sb %>% 
++   group_by(hex50_id, doy) %>% 
++   summarize(
++     num_observations = n(), 
++     uniqueSpecies = n_distinct(taxon_name),
++     .groups = "drop"
++   )
+> 
+> # merge these data to create a spatial summary of obs & richness per cell per doy 
+> hex_50_doy_tbl <- merge(hex_50km, doy_hex50_bin_summary, by = "hex50_id", all.x = TRUE)
+> 
+> # sum up the total obs across all spatial cells to build a histogram of phenology across the deserts (for histogram visual)
+> hex_50_doy_hist_summary <- hex_50_doy_tbl %>% 
++   sf::st_drop_geometry() %>% 
++   dplyr::group_by(doy) %>% 
++   dplyr::summarise(total_obs = sum(num_observations, na.rm = TRUE))
+> 
+> # create a map
+> map_plot <- ggplot() +
++   geom_sf(hex_50km, mapping = aes()) +
++   geom_sf(hex_50_doy_tbl, mapping = aes(fill = log(num_observations + 1)), color = NA) +
++   theme_bw() + # remove boring grey background 
++   scale_fill_gradientn(
++     colours = colorRampPalette(RColorBrewer::brewer.pal(11, "YlOrRd"))(9), 
++     na.value = "#808080", 
++     name = "log(N obs + 1)"
++   ) +
++   labs(
++     title = "Observation Intensity per 50km grid cell",
++     subtitle = "Day of Year: {frame_time}", 
++     caption = "iNaturalist Flowering Data annotated by PhenoVision", 
++     x = NULL, y = NULL
++   ) +
++   theme(
++     plot.title = element_text(size = 16, face = "bold"), 
++     plot.subtitle = element_text(size = 14),
++     legend.position = "right"
++   ) +
++   transition_time(doy)
+Warning message:
+In RColorBrewer::brewer.pal(11, "YlOrRd") :
+  n too large, allowed maximum for palette YlOrRd is 9
+Returning the palette you asked for with that many colors
+
+> 
+> # create an animation a save. 
+> map_anim <- animate(map_plot, nframes = 366, fps = 5, units = "in", width = 4, height = 4, res = 200, renderer = magick_renderer())
+> anim_save("/home/jt-miller/Gurlab/SuperBlooms/figures/hex_obs_by_doy2019.gif", animation = map_anim)
+
+ *** caught segfault ***
+address (nil), cause 'memory not mapped'
+
+Traceback:
+ 1: magick_image_write(image, format, quality, depth, density, comment,     compression)
+ 2: magick::image_write(animation, file)
+ 3: `save_animation.magick-image`(animation, filename)
+ 4: save_animation(animation, filename)
+ 5: anim_save("/home/jt-miller/Gurlab/SuperBlooms/figures/hex_obs_by_doy2019.gif",     animation = map_anim)
+An irrecoverable exception occurred. R is aborting now ...
+Segmentation fault (core dumped)
