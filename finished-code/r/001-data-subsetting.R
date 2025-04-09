@@ -33,17 +33,12 @@ basemap_wgs <- sf::st_read("/blue/guralnick/millerjared/SuperBlooms/data/raw/10m
 basemap <- sf::st_transform(basemap_wgs, PROJ_CRS)
 sonoran_shp <- sf::st_transform(sonoran_shp, PROJ_CRS)
 mojave_shp <- sf::st_transform(mojave_shp, PROJ_CRS)
-desert_shps <- rbind(sonoran_shp, mojave_shp)
-
-
-# Define color palette
-desert_cols <- c("Sonoran Desert" = "darkorange", "Mojave Basin and Range" = "goldenrod")
+desert_shps <- st_union(sonoran_shp, mojave_shp) # required step, as we need to assure that the boundaries of the shapefiles do not clip hexcells later in the code. 
 
 # Plot the study regions
 ggplot() + 
   geom_sf(data = basemap, fill = "white", color = "black") +  # Basemap layer
-  geom_sf(data = desert_shps, aes(fill = NA_L3NAME), color = "black") +  # Study regions with fill
-  scale_fill_manual(values = desert_cols, name = "Ecoregion") +  # Custom legend title
+  geom_sf(data = desert_shps, aes(), color = "black", fill = "darkorange") +  # Study regions with fill
   ggtitle("The Sonoran & Mojave Deserts") +
   theme_bw() +
   theme(
@@ -74,9 +69,8 @@ hexed_maps_storage[[i]] <- hex_map
 # Make a gridded map of these regions 
 ggplot() + 
   geom_sf(data = basemap, fill = "white", color = "black") +  # Basemap layer
-  geom_sf(data = desert_shps, aes(fill = NA_L3NAME), color = "black") +  # Study regions with fill
+  geom_sf(data = desert_shps, aes(), fill = "darkorange", color = "black") +  # Study regions with fill
   geom_sf(data = hex_map, mapping = aes(), alpha = 0.3) +
-  scale_fill_manual(values = desert_cols, name = "Ecoregion") +  # Custom legend title
   ggtitle(paste0("The Sonoran & Mojave Deserts ", hex_cell_sizes[i], "km Grid")) +
   theme_bw() +
   theme(
@@ -106,6 +100,11 @@ pheno_sf <- sf::st_as_sf(pheno_dt,
 # use shapes to filter out occurrences to only occur within the deserts range
 desert_obs <- pheno_sf[desert_shps,]
 desert_obs <- desert_obs %>% mutate(my_id = 1:n())
+
+# clean data for only flowering records as these are what are relevant for the question at hand. 
+desert_obs <- desert_obs %>% filter(phenology_trait == "flower")
+
+
 # use a for-loop to assign obs to grid cells for each iteration of grid type w/label 
 
 for(i in 1:length(hexed_maps_storage)){
@@ -115,6 +114,7 @@ for(i in 1:length(hexed_maps_storage)){
   desert_obs_id_field <- desert_obs_hexed %>% select(paste0("hex", hex_cell_sizes[i], "_id"), my_id) %>% st_drop_geometry()
   # merge, use the id we set up prior as the key
   desert_obs <- merge(desert_obs, desert_obs_id_field, by = "my_id") 
+  desert_obs <- desert_obs %>% distinct()
 }
 
 # drop spatial & added fields
