@@ -175,9 +175,54 @@ ggplot(desert_parks_wk_hist_summary, mapping = aes(x = week_bin, y = total_obs))
   theme(plot.title = element_text(hjust = 0.5)) +
   facet_wrap(~hex50_id)
 
+# use prior knowledge of some taxa listed in superblooms:
+superbloom_taxa <- c("Eschsocholzia californica", "Phacelia campanularia", "Encelia farinosa", "Lupinus",
+                     "Abronia", "Geraea canescens", "Chylismia brevipes", "Plagiobothrys", "Hesperocallis")
+
+# extract these records from the data 
+test_blooms <- flower_data_wsb %>% 
+  filter(str_detect(taxon_name, str_c("^", superbloom_taxa, collapse = "|")))
+
+bloom_wk_tbl <- merge(hex_50km, wk_hex50_bin_summary, by = "hex50_id", all.x = TRUE)
+
+test_blooms_wk_hist_summary <- bloom_wk_tbl  %>% 
+  sf::st_drop_geometry() %>% 
+  dplyr::group_by(week_bin, hex50_id) %>% 
+  dplyr::summarise(total_obs = sum(num_observations, na.rm = TRUE))
+
+# find top ten events
+top_10_hexcells <- test_blooms_wk_hist_summary %>% 
+  group_by(hex50_id) %>% 
+  summarize(total_bin_obs = sum(total_obs)) %>% 
+  arrange(desc(total_bin_obs)) %>% 
+  head(10) %>% 
+  select(hex50_id)
+
+top_bloom_wk_hist_summary <- filter(test_blooms_wk_hist_summary, hex50_id %in% top_10_hexcells$hex50_id)
+
+ggplot(top_bloom_wk_hist_summary, mapping = aes(x = week_bin, y = total_obs)) + 
+  geom_col(fill = "goldenrod", color = "black", width = 1) +
+  scale_x_continuous(breaks = seq(1, 52, by = 1)) +
+  labs(
+    x = "Week bin", 
+    y = "Number of Observations", 
+    title = "2019 Flowering Observations Across the Year"
+  ) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~hex50_id)
+
+# find hexcells:
+ggplot() + 
+  geom_sf(hex_50km, mapping = aes()) + 
+  geom_sf(filter(hex_50km, hex50_id %in% top_10_hexcells$hex50_id), mapping = aes(), fill = "goldenrod", alpha = 0.5) +
+  geom_sf_text(filter(hex_50km, hex50_id %in% top_10_hexcells$hex50_id), mapping = aes(label = hex50_id), size = 3, color = "black")
+
 # check out data in high obs density bins
-test <- filter(find_blooms, hex50_id == 617)
-test <- filter(test, week_bin == 11)
+test <- filter(test_blooms, hex50_id == 740)
+test <- filter(test, week_bin == 12)
 high_density_week <- desert_parks_wk_hist_summary[, max(desert_parks_wk_hist_summary$total_obs)]
 flower_data_test <- flower_data_wsb %>% 
   filter(week_bin == max(desert_parks_wk_hist_summary))
