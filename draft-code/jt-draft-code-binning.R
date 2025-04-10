@@ -13,9 +13,10 @@ library(tidyverse)
 library(sf)
 library(RColorBrewer)
 
-# load the subsetted data
+# load flowering data
 flower_data <- fread("./data/processed/desert-observations-hexed.csv")
 flower_data <- flower_data %>% distinct(obs_url, .keep_all=TRUE)
+
 
 # grab observations in 2016, 2019, and 2023, construct bins: weekly, monthly
 flower_data_sbs <- flower_data %>% 
