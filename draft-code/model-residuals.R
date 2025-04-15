@@ -81,19 +81,40 @@ mod <- mgcv::gam(num_observations_flowering ~
                  data = wkbin_hex_year_summary, 
                  family = "poisson")
 
+wkbin_hex_year_summary2 <- mutate(wkbin_hex_year_summary2, hex50_id = as.factor(hex50_id)) %>% mutate(log_area = log(as.numeric(area) + 1))
+# remove highly skewed low area cells from the dataset, as these are causing fititng issues.
+wkbin_hex_year_summary3 <- wkbin_hex_year_summary2 %>% filter(as.numeric(area) >= 84230390)
 mod <- gam(num_observations_flowering ~ 
              s(week_bin, bs = "cs") + 
-             s(hex50_id, bs = "re") + 
+             #s(hex50_id, bs = "re") + 
              s(year, bs = "cs", k = 7) +
-             s(as.numeric(area), bs = "tp") + # unsure about this, but I think area could be non-linear and it needs to be better at adapting to extremes so we're using thin plate splines
+             s(as.numeric(area), bs = "tp", k = 10) + # unsure about this, but I think area could be non-linear and it needs to be better at adapting to extremes so we're using thin plate splines
              log(num_observations_total), # removed offset in order to allow the model to learn from obs data 
            data = wkbin_hex_year_summary2, 
-           family = "nb")
+           family = "poisson")
+
+mod_nb <- gam(num_observations_flowering ~ 
+                s(week_bin, bs = "cs", k = 15) + 
+                s(hex50_id, bs = "re") +
+                s(year, bs = "cs", k = 7) +
+                #s(as.numeric(area), bs = "tp", k = 109) +
+                s(log_area, bs = "tp", k = 100) +
+                log(num_observations_total),
+              method = "REML",
+              data = wkbin_hex_year_summary3, 
+              family = nb())
+
+gam.check(mod_nb)
+
+mod <- mod_nb
 summary(mod)
 plot(mod, pages = 1, residuals = TRUE, shade = TRUE, seWithMean = TRUE)
 library(gratia)
 draw(mod, residuals = TRUE) # prob a more informative plot
+png(filename = "./figures/gam-50km-wkbin-plots-noresiduals.png", width = 800, height = 600, res = 100)
+draw(mod)
 
+dev.off()
 residuals_raw <- residuals(mod, type = "pearson")
 hist(residuals_raw, breaks = 30, main = "Pearsons Risiduals Histogram")
 
@@ -106,18 +127,23 @@ abline(h = 0, col = "red")
 library(DHARMa)
 sim_res <- simulateResiduals(mod, plot = TRUE)
 sim_test_outliers <- testOutliers(sim_res, type = "bootstrap")
-# check for overdispersion, especially if the test above is sig
+ # check for overdispersion, especially if the test above is sig
 testDispersion(sim_res)
 
+# draw a rootogram 
+rootogram(mod, max = 600) %>% draw()
 # Extract deviations as superbloom candidates
-wkbin_hex_year_summary$resid <- residuals(mod, type = "pearson")
-wkbin_hex_year_summary$fitted <- fitted(mod)
+wkbin_hex_year_summary3$resid <- residuals(mod, type = "pearson")
+wkbin_hex_year_summary3$fitted <- fitted(mod)
 
 # ID large pos residuals (z-score > 2)
-wkbin_hex_year_summary$superBloomCandidate <- wkbin_hex_year_summary$resid > 2
+wkbin_hex_year_summary3$superBloomCandidate <- wkbin_hex_year_summary3$resid > 2
 
-test <- filter(wkbin_hex_year_summary, superBloomCandidate == TRUE)
-
+test <- filter(wkbin_hex_year_summary3, superBloomCandidate == TRUE)
+test %>% group_by(year) %>% summarize(n = n()) %>% arrange(desc(n))
+# we know that superblooms are a spring occurrence, therefore lets remove candidates that happen after the last week of May : doy 151/7 = 21.5 ~ 22
+test_spring <- filter(test , week_bin <= 22)
+test_spring %>% group_by(year) %>% summarize(n = n()) %>% arrange(desc(n))
 # visualize the estimated effects of vars on the model 
 summary(mod)
 draw(mod, select = 1)
@@ -128,6 +154,114 @@ draw(mod, select = 3)
 draw(mod, select = 3, residuals = TRUE)
 draw(mod, select = 4)
 draw(mod, select = 4, residuals = TRUE)
+
+
+
+### More scratch work #########################################################################
+# annotated & hexbinned flowering data
+flower_data <- data.table::fread("./data/processed/desert-observations-hexed.csv")
+# load background observation data for vascular plants of these regions (hexbinned prior)
+obs_data <- fread("./data/processed/tracheophyte-desert-inats.csv")
+flower_data <- dplyr::distinct(flower_data, obs_url, .keep_all = TRUE)
+obs_data <- obs_data %>% 
+  mutate(eventDateParsed = parse_date_time(eventDate, orders = c("ymd_HMS", "ymd_HM", "ymd"))) %>% 
+  mutate(doy = lubridate::yday(eventDateParsed)) %>% 
+  mutate(year = lubridate::year(eventDateParsed)) %>% 
+  mutate(month = lubridate::month(eventDateParsed))
+# create temporal bins 
+flower_data_temporalbins <- flower_data %>% 
+  # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>%
+  # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% 
+  # remove tail end data 
+  dplyr::filter(!is.na(week_bin)) %>% 
+  dplyr::filter(!is.na(month_bin))
+
+# for obs data 
+obs_data_temporalbins <- obs_data %>% 
+  # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>%
+  # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% 
+  # remove tail end data 
+  dplyr::filter(!is.na(week_bin)) %>% 
+  dplyr::filter(!is.na(month_bin))
+
+# set up spatial & temporal bin retrieval vectors
+hex_map_files <- list.files("./data/processed", pattern = "\\.rds$", full.names = TRUE)
+hex_map_res <- c(100, 10, 25, 50, 5)
+temporal_bins <- c("doy", "week_bin", "month_bin")
+
+# edit depending on what im curious to test. 
+hex_grab <- 4
+hex_cell_size <- hex_map_res[hex_grab]
+temporal_name <- temporal_bins[2]
+# create group by vars
+hex_name <- paste0("hex", hex_cell_size, "_id")
+group_col <- list(sym("year"), sym(hex_name), sym(temporal_name))
+# assign bins
+hex_flower_data_bin <- flower_data_temporalbins %>% 
+  group_by(!!!group_col) %>% # !!! splice operator
+  summarize( 
+    num_observations_flowering = n(), 
+    uniqueFloweringSpecies = n_distinct(taxon_name),
+    .groups = "drop")
+
+hex_obs_data_bin <- obs_data_temporalbins %>% 
+  group_by(!!!group_col) %>% # use !!! splice operator     
+  summarize(
+    num_observations_total = n(), 
+    uniqueObsSpecies = n_distinct(verbatimScientificName), 
+    .groups = "drop"
+  )
+# merge flowreing and obs data 
+hex_flower_obs_bin <- merge(hex_flower_data_bin, hex_obs_data_bin, by = c("year", hex_name, temporal_name), all.x = TRUE)
+# remove data that has incorrect background
+hex_flower_obs_bin <- hex_flower_obs_bin %>%       
+  filter(!is.na(num_observations_total)) %>% # remove na obs
+  mutate(obsFlowerRatioCheck = ifelse(num_observations_flowering <= num_observations_total, TRUE, FALSE)) %>% 
+  filter(obsFlowerRatioCheck == TRUE)
+# add area as a var 
+hex_grid <- read_rds(paste0(hex_map_files[hex_grab]))
+hex_info <- select(hex_grid, hex_name, area) %>% sf::st_drop_geometry()
+hex_flower_obs_bin <- merge(hex_info, hex_flower_obs_bin , by = hex_name)
+hex_flower_obs_bin <- hex_flower_obs_bin %>% 
+  mutate(hex50_id = as.factor(hex50_id), 
+         log_area = log(as.numeric(area) + 1))
+# Attempt to fit a GAM 
+knots <- list(week_bins = c(0.5, 52.5))
+mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
+                te(year, week_bin, bs = c("tp", "cc"), k = 30) + # for seasonal events, if we want them to vary overtime.
+                s(hex50_id, bs = "re") + # code hexcell id as a random effect
+                s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
+                log(num_observations_total),
+              knots = knots, # where the cyclical spline should bridge data
+              method = "fREML",
+              data = hex_flower_obs_bin, 
+              family = nb())
+
+##############################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # build a plot IDing superblooms and plots where superblooms occurred in 2019
 library(ggplot2)
 # load in gridded map of study region 
