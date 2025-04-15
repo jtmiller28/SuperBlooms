@@ -12,7 +12,8 @@ library(data.table)
 library(tidyverse)
 library(lubridate)
 library(mgcv)
-
+library(gratia)
+library(DHARMa)
 ### Load the hexed flowering obs data
 flower_data <- fread("./data/processed/desert-observations-hexed.csv")
 # we only want unique observations (currently the data is structured so that multiple images of one obs event take up uniq rows)
@@ -229,10 +230,15 @@ hex_flower_obs_bin <- merge(hex_info, hex_flower_obs_bin , by = hex_name)
 hex_flower_obs_bin <- hex_flower_obs_bin %>% 
   mutate(hex50_id = as.factor(hex50_id), 
          log_area = log(as.numeric(area) + 1))
+# remove data from years of low data sampling
+year_obs_check <- hex_flower_obs_bin %>% group_by(year) %>% summarize(n = sum(num_observations_flowering)) %>% arrange(desc(n))
+year_obs_500 <- year_obs_check %>% filter(n >= 500) # set an arbitrary req
+hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(year %in% year_obs_500$year) %>% filter(year != 2024) # also remove year 2024, as this data is truncated by the 12th week
+#hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(num_observations_total != 1) # attempt removal of data (1s are wierdly skewing the data)
 # Attempt to fit a GAM 
 knots <- list(week_bins = c(0.5, 52.5))
-mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
-                te(year, week_bin, bs = c("tp", "cc"), k = 30) + # for seasonal events, if we want them to vary overtime.
+mod_nb <- bam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
+                te(year, week_bin, bs = c("tp", "cc"), k = 10) + # for seasonal events, if we want them to vary overtime.
                 s(hex50_id, bs = "re") + # code hexcell id as a random effect
                 s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
                 log(num_observations_total),
@@ -240,7 +246,48 @@ mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowe
               method = "fREML",
               data = hex_flower_obs_bin, 
               family = nb())
+set.seed(100)
+mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
+                s(year) + # overall trend
+                s(week_bin, bs = "cc") + # seasonal effect
+                # use tensor product to gather up interaction term?
+               # ti(year, week_bin, bs = c("tp", "cc"), k = 13) + # for seasonal events, if we want to make them interact and vary overtime.
+                s(hex50_id, bs = "re") + # code hexcell id as a random effect
+                s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
+                log(num_observations_total),
+              knots = knots, # where the cyclical spline should bridge data
+              method = "REML",
+              data = hex_flower_obs_bin, 
+              family = nb())
 
+# check model results 
+summary(mod_nb)
+
+# check whether k-value basis needs adj
+gam.check(mod_nb)
+
+# draw gam
+draw(mod_nb)
+rootogram(mod_nb, max = 300) %>% draw()
+# use DARHMa to check for regular glm assumptions being met
+sim_res <- DHARMa::simulateResiduals(mod_nb, plot = TRUE)
+sim_test_outliers <- testOutliers(sim_res, type = "bootstrap")
+# check for overdispersion, especially if the test above is sig
+testDispersion(sim_res)
+
+# use a residuals test to pull out and label candidate superblooms
+hex_flower_obs_bin$resid <- residuals(mod_nb, type = "pearson")
+hex_flower_obs_bin$fitted <- fitted(mod_nb)
+
+# ID large pos residuals (z-score > 2)
+hex_flower_obs_bin$superBloomCandidate <- hex_flower_obs_bin$resid > 2
+
+possibleSuperblooms <- filter(hex_flower_obs_bin, superBloomCandidate == TRUE)
+possibleSuperblooms %>% group_by(year) %>% summarize(n = n()) %>% arrange(desc(n))
+# we know that superblooms are a spring occurrence, therefore lets remove candidates that happen after the last week of May : doy 151/7 = 21.5 ~ 22
+possibleSuperblooms_springOnly<- filter(possibleSuperblooms , week_bin <= 22)
+possibleSuperblooms_springOnly %>% group_by(year) %>% summarize(n = n()) %>% arrange(desc(n))
+fwrite(possibleSuperblooms_springOnly, "/blue/guralnick/millerjared/SuperBlooms/data/processed/possibleCandidateSuperblooms.csv")
 ##############################################################################################
 
 
