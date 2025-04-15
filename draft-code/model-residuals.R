@@ -232,7 +232,7 @@ hex_flower_obs_bin <- hex_flower_obs_bin %>%
          log_area = log(as.numeric(area) + 1))
 # remove data from years of low data sampling
 year_obs_check <- hex_flower_obs_bin %>% group_by(year) %>% summarize(n = sum(num_observations_flowering)) %>% arrange(desc(n))
-year_obs_500 <- year_obs_check %>% filter(n >= 500) # set an arbitrary req
+year_obs_500 <- year_obs_check %>% filter(n >= 100) # set an arbitrary req
 hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(year %in% year_obs_500$year) %>% filter(year != 2024) # also remove year 2024, as this data is truncated by the 12th week
 #hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(num_observations_total != 1) # attempt removal of data (1s are wierdly skewing the data)
 # Attempt to fit a GAM 
@@ -251,7 +251,7 @@ mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowe
                 s(year) + # overall trend
                 s(week_bin, bs = "cc") + # seasonal effect
                 # use tensor product to gather up interaction term?
-               # ti(year, week_bin, bs = c("tp", "cc"), k = 13) + # for seasonal events, if we want to make them interact and vary overtime.
+                ti(year, week_bin, bs = c("tp", "cc"), k = 17) + # for seasonal events, if we want to make them interact and vary overtime.
                 s(hex50_id, bs = "re") + # code hexcell id as a random effect
                 s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
                 log(num_observations_total),

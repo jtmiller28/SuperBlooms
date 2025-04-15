@@ -12,6 +12,7 @@ library(data.table)
 library(tidyverse)
 library(sf)
 library(RColorBrewer)
+library(ggplot2)
 
 # load flowering data
 flower_data <- fread("./data/processed/desert-observations-hexed.csv")
@@ -227,3 +228,112 @@ test <- filter(test, week_bin == 12)
 high_density_week <- desert_parks_wk_hist_summary[, max(desert_parks_wk_hist_summary$total_obs)]
 flower_data_test <- flower_data_wsb %>% 
   filter(week_bin == max(desert_parks_wk_hist_summary))
+
+
+### Species Extractions from candidate superblooms
+# load packages
+library(dplyr)
+library(data.table)
+
+# load data
+superbloom_candidates <- fread("./data/processed/possibleCandidateSuperblooms.csv")
+## Load the hexed flowering obs data
+flower_data <- fread("./data/processed/desert-observations-hexed.csv")
+
+# we only want unique observations (currently the data is structured so that multiple images of one obs event take up uniq rows)
+flower_data <- dplyr::distinct(flower_data, obs_url, .keep_all = TRUE)
+
+# create temporal bins 
+flower_data_temporalbins <- flower_data %>% 
+  # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>%
+  # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% 
+  # remove tail end data 
+  dplyr::filter(!is.na(week_bin)) %>% 
+  dplyr::filter(!is.na(month_bin))
+
+# create summary tables comparing the species composition between candidate superblooms 
+select_flowering_data <- flower_data_temporalbins %>% 
+  dplyr::select(year, family, taxon_name, hex50_id, week_bin)
+
+select_flowering_superbloomCandidateData <- select_flowering_data %>% 
+  inner_join(superbloom_candidates, by = c("year", "hex50_id", "week_bin"))
+
+uniq_cells_num <- length(unique(select_flowering_superbloomCandidateData$hex50_id))
+superbloom_spatial_summary <- select_flowering_superbloomCandidateData %>% 
+  group_by(hex50_id, taxon_name) %>%
+  dplyr::summarize(n = n()) %>%
+  ungroup() %>% 
+  group_by(taxon_name) %>% 
+  dplyr::summarize(distinctCellsOccupied = n_distinct(hex50_id), 
+                   percentOccupied = distinctCellsOccupied/uniq_cells_num)
+
+uniq_wkbin_num <- length(unique(select_flowering_superbloomCandidateData$week_bin))
+superbloom_temporal_summary <- select_flowering_superbloomCandidateData %>% 
+  group_by(week_bin, taxon_name) %>%
+  dplyr::summarize(n = n()) %>%
+  ungroup() %>% 
+  group_by(taxon_name) %>% 
+  dplyr::summarize(distinctWkBinsOccupied = n_distinct(week_bin), 
+                   percentOccupied = distinctWkBinsOccupied/uniq_wkbin_num)
+
+#### try some matrix comparisons:
+
+# create an event id by temporal
+select_flowering_superbloomCandidateData  <- select_flowering_superbloomCandidateData  %>% 
+  mutate(event_id = paste(year, week_bin, sep = "_"))
+
+# create a field of lists of taxa per event
+taxa_list <- select_flowering_superbloomCandidateData %>% 
+  distinct(taxon_name, event_id) %>% 
+  group_by(event_id) %>% 
+  summarize(taxa = list(unique(taxon_name)), .groups = "drop")
+
+# do pairwise combinations of events
+event_pairs <- expand.grid(event_id1 = taxa_list$event_id, 
+                           event_id2 = taxa_list$event_id, 
+                           stringsAsFactors = FALSE)
+# calc the shared taxa among events
+compare_fxn <- function(event_id1, event_id2, taxa_list){
+  taxa1 <- taxa_list$taxa[taxa_list$event_id == event_id1][[1]]
+  taxa2 <- taxa_list$taxa[taxa_list$event_id == event_id2][[1]]
+  intersect_taxa <- intersect(taxa1, taxa2)
+  
+  tibble(
+    event_id1 = event_id1, 
+    event_id2 = event_id2, 
+    n_taxa_1 = length(taxa1), 
+    n_taxa_2 = length(taxa2), 
+    n_shared = length(intersect_taxa), 
+    pct_shared_1 = length(intersect_taxa)/length(taxa1),
+    pct_shared_2 = length(intersect_taxa)/length(taxa2)
+  )
+}
+
+comp_tb <- purrr::pmap_dfr(
+  event_pairs,
+  .f = compare_fxn,
+  taxa_list = taxa_list
+)
+
+# create a jaccard similairy index 
+comp_tb <- comp_tb %>% 
+  mutate(jaccard = n_shared / (n_taxa_1 + n_taxa_2 - n_shared))
+
+ggplot(comp_tb, aes(x = event_id1, y = event_id2, fill = jaccard)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "plasma", name = "Jaccard Similarity") +
+  labs(
+    title = "Pairwise Taxonomic Similarity Across Superbloom Events",
+    x = "Event ID",
+    y = "Event ID"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+ggsave("./figures/jaccard-similarity-superbloomEvents.png", width = 14, height = 14)
+
