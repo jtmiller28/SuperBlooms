@@ -237,16 +237,16 @@ hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(year %in% year_obs_500$year)
 #hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(num_observations_total != 1) # attempt removal of data (1s are wierdly skewing the data)
 # Attempt to fit a GAM 
 knots <- list(week_bins = c(0.5, 52.5))
-mod_nb <- bam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
-                te(year, week_bin, bs = c("tp", "cc"), k = 10) + # for seasonal events, if we want them to vary overtime.
-                s(hex50_id, bs = "re") + # code hexcell id as a random effect
-                s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
-                log(num_observations_total),
-              knots = knots, # where the cyclical spline should bridge data
-              method = "fREML",
-              data = hex_flower_obs_bin, 
-              family = nb())
-set.seed(100)
+# mod_nb <- bam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
+#                 te(year, week_bin, bs = c("tp", "cc"), k = 10) + # for seasonal events, if we want them to vary overtime.
+#                 s(hex50_id, bs = "re") + # code hexcell id as a random effect
+#                 s(log_area, bs = "tp", k = 10) + # log of area with a thin-plate spline 
+#                 log(num_observations_total),
+#               knots = knots, # where the cyclical spline should bridge data
+#               method = "fREML",
+#               data = hex_flower_obs_bin, 
+#               family = nb())
+#set.seed(100)
 mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowering records obs
                 s(year) + # overall trend
                 s(week_bin, bs = "cc") + # seasonal effect
@@ -259,7 +259,18 @@ mod_nb <- gam(num_observations_flowering ~ # Y (response var) is number of flowe
               method = "REML",
               data = hex_flower_obs_bin, 
               family = nb())
-
+# attempt a tweedee family
+mod_zp <- gam(num_observations_flowering ~ 
+                s(year) + 
+                s(week_bin, bs = "cc") + 
+                ti(year, week_bin, bs = c("tp", "cc"), k = 17) +
+                s(hex50_id, bs = "re") +
+                s(log_area, bs = "tp", k = 10) +
+                log(num_observations_total),
+              data = hex_flower_obs_bin,
+              family = ziP(),
+              method = "REML",
+              knots = knots)
 # check model results 
 summary(mod_nb)
 
