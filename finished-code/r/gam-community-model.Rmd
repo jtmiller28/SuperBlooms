@@ -1,0 +1,526 @@
+---
+title: "gam-community-model"
+author: "jt-miller"
+date: "2025-04-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Use a General Additive Model (GAM) to model spring community flowering trends in Desert
+
+Load Packages 
+```{r}
+library(data.table) # for fast read and write
+library(tidyverse) # for data wrangling 
+library(lubridate) # for date handling
+library(mgcv) # for gam modeling
+library(gratia) # for gam visuals
+library(DHARMa) # for glm assumption checking
+library(knitr) # for constructing result tables
+library(gridExtra) # extra grid fxns for tables
+library(grid) # more table functionality
+```
+
+#### Step 1. Data Processing
+
+Load relevant data sources
+```{r}
+# read in the desert flowering annotated dataset
+flower_data <- data.table::fread("/blue/guralnick/millerjared/SuperBlooms/data/processed/desert-observations-hexed.csv")
+# load background RG iNaturalist observation data for vascular plants of these regions 
+obs_data <- fread("/blue/guralnick/millerjared/SuperBlooms/data/processed/tracheophyte-desert-inats.csv")
+
+# set up file pathing to gather rds objects of premade grid cell maps 
+hex_map_files <- list.files("/blue/guralnick/millerjared/SuperBlooms/data/processed", pattern = "\\.rds$", full.names = TRUE)
+```
+Wrangle data
+```{r}
+# remove redundant annotated flowering data for unique observational records
+flower_data <- dplyr::distinct(flower_data, obs_url, .keep_all = TRUE)
+
+# standardize temporal fields for background obs data
+obs_data <- obs_data %>% 
+  mutate(eventDateParsed = parse_date_time(eventDate, orders = c("ymd_HMS", "ymd_HM", "ymd"))) %>% 
+  mutate(doy = lubridate::yday(eventDateParsed)) %>% 
+  mutate(year = lubridate::year(eventDateParsed)) %>% 
+  mutate(month = lubridate::month(eventDateParsed))
+
+# create temporal bins for flowering data
+flower_data_temporalbins <- flower_data %>% # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>% # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% 
+  dplyr::filter(!is.na(week_bin)) %>% # remove records that failed to be binned appropriately 
+  dplyr::filter(!is.na(month_bin))
+
+# do the same temporal binning for the background obs data
+obs_data_temporalbins <- obs_data %>% # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>% # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% # remove records that failed to be binned appropriately 
+  dplyr::filter(!is.na(week_bin)) %>% 
+  dplyr::filter(!is.na(month_bin))
+
+```
+
+
+From an ecologist perspective, we want the data with the fine grain temporal and spatial resolution, however from knowing these data making a model to the finest scale (5km^2, day of year) will be challening to fit. Therefore, lets try the middle road of week bins and 50km^2 hex cells.
+```{r}
+# set up spatial & temporal bin retrieval vectors
+hex_map_res <- c(100, 10, 25, 50, 5)
+temporal_bins <- c("doy", "week_bin", "month_bin")
+
+# grab relevant data for 50x50km & weekbins 
+hex_grab <- 4
+hex_cell_size <- hex_map_res[hex_grab]
+temporal_name <- temporal_bins[2]
+
+# create groupings for subsequent data summaries 
+hex_name <- paste0("hex", hex_cell_size, "_id")
+group_col <- list(sym("year"), sym(hex_name), sym(temporal_name))
+
+# summarize into interpretable tables grouped hex cell-year-weekbin
+hex_flower_data_bin <- flower_data_temporalbins %>% 
+  group_by(!!!group_col) %>% # !!! splice operator
+  summarize( 
+    num_observations_flowering = n(), 
+    uniqueFloweringSpecies = n_distinct(taxon_name),
+    .groups = "drop")
+
+# do the same for the the background obs data 
+hex_obs_data_bin <- obs_data_temporalbins %>% 
+  group_by(!!!group_col) %>% # use !!! splice operator     
+  summarize(
+    num_observations_total = n(), 
+    uniqueObsSpecies = n_distinct(verbatimScientificName), 
+    .groups = "drop"
+  )
+
+# merge flowering data with obs data 
+hex_flower_obs_bin <- merge(hex_flower_data_bin, hex_obs_data_bin, by = c("year", hex_name, temporal_name), all.x = TRUE)
+
+# due to our proxy of background data, we need to remove cases that do not make sense. throw these out for simplicity.
+hex_flower_obs_bin <- hex_flower_obs_bin %>%       
+  filter(!is.na(num_observations_total)) %>% # remove na obs
+  mutate(obsFlowerRatioCheck = ifelse(num_observations_flowering <= num_observations_total, TRUE, FALSE)) %>% 
+  filter(obsFlowerRatioCheck == TRUE)
+
+# Our hexcells are not quite the same area contents at the edges of the desert due to shape clipping, we can create an area variable and put it into our model to better deal with this. 
+hex_grid <- read_rds(paste0(hex_map_files[hex_grab]))
+hex_info <- select(hex_grid, hex_name, area) %>% sf::st_drop_geometry()
+hex_flower_obs_bin <- merge(hex_info, hex_flower_obs_bin , by = hex_name)
+hex_flower_obs_bin <- hex_flower_obs_bin %>% 
+  mutate(hex50_id = as.factor(hex50_id), 
+         log_area = log(as.numeric(area) + 1))
+```
+#### 2. Data Removal
+This data is messy by nature. We're going to remove some things that are obviously going to be an issue
+
+1. Lets remove years that have low amounts of sampling, as these are unlikely to be informative to the model as a whole. 
+```{r}
+year_obs_check <- hex_flower_obs_bin %>% group_by(year) %>% summarize(n = sum(num_observations_flowering)) %>% arrange(desc(n))
+year_obs_500 <- year_obs_check %>% filter(n >= 500) # set an arbitrary req
+hex_flower_obs_bin <- hex_flower_obs_bin %>% filter(year %in% year_obs_500$year) %>% filter(year != 2024) # also remove year 2024, as this data is truncated by the 12th week
+```
+
+2. Lets remove data past week 22 marking the end of the month of May. This decision is because we're not looking at Fall bloom events (an equally interesting question in deserts...)
+```{r}
+hex_flower_obs_bin_spring <- hex_flower_obs_bin %>% 
+  filter(week_bin <= 22)
+```
+
+#### Step 3. Apply GAM & Check Model Assumptions
+```{r}
+mod_nb <- gam(num_observations_flowering ~ # Y response var
+                s(year, bs = "cs") + # overall yearly trend
+                s(week_bin, bs = "cs") + # seasonal effect
+                s(hex50_id, bs = "re") + # code hexcell id as a random effect
+                s(log_area, bs = "tp") + # log of area with a thin-plate spline 
+                num_observations_total, # use number of background obs as a fixed effect in order to account for sampling effort. 
+              method = "REML", # method recommended by Gavin Simpsons ecological forecasting course. 
+              data = hex_flower_obs_bin_spring, 
+              family = nb()) # use family negative binomial, if dispersion is low this will act like a poisson anyway.
+
+summary(mod_nb)
+```
+
+Check GAM & GLM assumptions to see if we're in the clear
+```{r}
+# check whether basis search did well enough. 
+gam.check(mod_nb)
+
+# check what the smooths looked like 
+draw(mod_nb)
+ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/gam-model-trends.png", width = 10, height = 10)
+# draw a rootagram to infer how well the data matches expected area of fit 
+rootogram(mod_nb) %>% draw()
+ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/gam-model-rootogram.png", width = 10, height = 10)
+
+# use the DHARMa package to assess how well we fullfill typical GLM assumptions
+# check residuals fit 
+png("/blue/guralnick/millerjared/SuperBlooms/figures/gam-model-residual-simu.png", width = 600, height = 480)
+sim_res <- DHARMa::simulateResiduals(mod_nb, plot = TRUE)
+dev.off()
+
+# check for crazy outliers
+png("/blue/guralnick/millerjared/SuperBlooms/figures/gam-model-residual-simu-outliers.png", width = 600, height = 480)
+sim_test_outliers <- testOutliers(sim_res, type = "bootstrap")
+dev.off()
+# check for overdispersion, especially if the test above is sig
+png("/blue/guralnick/millerjared/SuperBlooms/figures/gam-model-residual-simu-dispersion.png", width = 600, height = 480)
+testDispersion(sim_res)
+dev.off()
+```
+Use positive residuals that sit outside of 95% of the data as a way to pull out candidate superblooms
+```{r}
+# use a residuals test to pull out and label candidate superblooms
+hex_flower_obs_bin_spring$resid <- residuals(mod_nb, type = "pearson")
+hex_flower_obs_bin_spring$fitted <- fitted(mod_nb)
+
+# ID large pos residuals (z-score > 2)
+hex_flower_obs_bin_spring$superBloomCandidate <- hex_flower_obs_bin_spring$resid > 2
+
+# fitler down to only include these superbloom candidate bins
+possibleSuperblooms <- filter(hex_flower_obs_bin_spring, superBloomCandidate == TRUE)
+possibleSuperblooms %>% group_by(year) %>% summarize(n = n()) %>% arrange(desc(n))
+
+top10_superbloom_years <- hex_flower_obs_bin_spring %>%
+  filter(superBloomCandidate == TRUE) %>%
+  group_by(year) %>%
+  summarize(n = n()) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+# Display table
+kable(top10_superbloom_years, 
+      col.names = c("Year", "Number of Superbloom Bins"), 
+      caption = "Top 5 Years with Most Superbloom Candidate Bins")
+
+# create a output png table version
+
+# Create the table grob
+tbl <- tableGrob(top10_superbloom_years, rows = NULL)
+
+# Create the title grob (multi-line)
+title <- textGrob("Top 5 Years with Most Superbloom \n Candidate Bins",
+                  gp = gpar(fontsize = 12, fontface = "bold"))
+
+# Calculate actual title height
+title_height <- grobHeight(title) + unit(1, "mm")  # Add a little buffer
+
+# Combine title and table
+tbl_with_title <- arrangeGrob(
+  title, tbl,
+  ncol = 1,
+  heights = unit.c(title_height, unit(1, "npc") - title_height)
+)
+
+# Save to PNG
+png("/blue/guralnick/millerjared/SuperBlooms/figures/top5_superblooms.png", width = 200, height = 175)
+grid.draw(tbl_with_title)
+dev.off()
+
+
+top5_flowering_obs <- hex_flower_obs_bin_spring %>%
+  group_by(year) %>%
+  summarize(n = n()) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+# Display table
+kable(top5_flowering_obs, 
+      col.names = c("Year", "Number of Flowering Bins"), 
+      caption = "Top 5 Years with Flowering Bins")
+
+# create output table png again
+# Create the table grob
+tbl <- tableGrob(top5_flowering_obs, rows = NULL)
+
+# Create the title grob (multi-line)
+title <- textGrob("Top 5 Years with Most Flowering \n Observation Bins",
+                  gp = gpar(fontsize = 12, fontface = "bold"))
+
+# Calculate actual title height
+title_height <- grobHeight(title) + unit(1, "mm")  # Add a little buffer
+
+# Combine title and table
+tbl_with_title <- arrangeGrob(
+  title, tbl,
+  ncol = 1,
+  heights = unit.c(title_height, unit(1, "npc") - title_height)
+)
+
+# Save to PNG
+png("/blue/guralnick/millerjared/SuperBlooms/figures/top5_flower_obs_bins.png", width = 200, height = 175)
+grid.draw(tbl_with_title)
+dev.off()
+
+```
+
+Visual To assist 
+```{r}
+# Create a standard normal distribution
+x <- seq(-4, 4, length.out = 1000)
+y <- dnorm(x)
+
+# Create a data frame
+df <- data.frame(x = x, y = y)
+
+# Create the plot
+ggplot(df, aes(x, y)) +
+  geom_line(size = 1) +
+  geom_area(data = subset(df, x > 2), aes(x, y), fill = "red", alpha = 0.6) +
+  labs(title = "Standard Normal Distribution",
+       subtitle = "Residuals > 2 (superbloom candidates)",
+       x = "Pearson Residual",
+       y = "Density") +
+  theme_minimal(base_size = 14)
+
+ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/pearsons-res-vis.png", width = 10, height = 10)
+``` 
+
+Now use these data to create a species extraction table and some figures.
+```{r}
+# extract species data 
+# load data
+flower_data <- fread("/blue/guralnick/millerjared/SuperBlooms/data/processed/desert-observations-hexed.csv")
+superbloom_candidates <- possibleSuperblooms # the data for superblooms
+
+# we only want unique observations (currently the data is structured so that multiple images of one obs event take up uniq rows)
+flower_data <- dplyr::distinct(flower_data, obs_url, .keep_all = TRUE)
+
+# create temporal bins 
+flower_data_temporalbins <- flower_data %>% 
+  # weekly bins
+  dplyr::mutate(week_bin = cut(doy, breaks = seq(1, 366, by = 7), right = FALSE, labels = FALSE)) %>%
+  # monthly bins
+  dplyr::mutate(month_bin = cut(doy, breaks = seq(1,366, by = 30), right = FALSE, labels = FALSE)) %>% 
+  # remove tail end data 
+  dplyr::filter(!is.na(week_bin)) %>% 
+  dplyr::filter(!is.na(month_bin))
+
+# create summary tables comparing the species composition between candidate superblooms 
+select_flowering_data <- flower_data_temporalbins %>% 
+  dplyr::select(year, family, taxon_name, hex50_id, week_bin) %>% 
+  mutate(hex50_id = as.factor(hex50_id))
+
+select_flowering_superbloomCandidateData <- select_flowering_data %>% 
+  inner_join(superbloom_candidates, by = c("year", "hex50_id", "week_bin"))
+
+uniq_cells_num <- length(unique(select_flowering_superbloomCandidateData$hex50_id))
+superbloom_spatial_summary <- select_flowering_superbloomCandidateData %>% 
+  group_by(hex50_id, taxon_name) %>%
+  dplyr::summarize(n = n()) %>%
+  ungroup() %>% 
+  group_by(taxon_name) %>% 
+  dplyr::summarize(distinctCellsOccupied = n_distinct(hex50_id), 
+                   percentOccupied = distinctCellsOccupied/uniq_cells_num)
+uniq_wkbin_num <- length(unique(select_flowering_superbloomCandidateData$week_bin))
+superbloom_temporal_summary <- select_flowering_superbloomCandidateData %>% 
+  group_by(week_bin, taxon_name) %>%
+  dplyr::summarize(n = n()) %>%
+  ungroup() %>% 
+  group_by(taxon_name) %>% 
+  dplyr::summarize(distinctWkBinsOccupied = n_distinct(week_bin), 
+                   percentOccupied = distinctWkBinsOccupied/uniq_wkbin_num)
+
+```
+Create tables for representing these summaries
+```{r}
+top5_superbloom_spatial_summary <- superbloom_spatial_summary %>%
+  arrange(desc(distinctCellsOccupied)) %>%
+  slice_head(n = 5)
+
+# Display table
+kable(top5_superbloom_spatial_summary, 
+      col.names = c("Taxon", "distinct cells occupied", "percent of total cells occupied"), 
+      caption = "Top 5 spatial taxa for superbloom candidates")
+
+top5_superbloom_temporal_summary <- superbloom_temporal_summary %>%
+  arrange(desc(distinctWkBinsOccupied)) %>%
+  slice_head(n = 5)
+
+# Display table
+kable(top5_superbloom_temporal_summary, 
+      col.names = c("Taxon", "distinct week bins occupied", "percent of total week bins occupied"), 
+      caption = "Top 5 temporal bins taxa for superbloom candidates")
+```
+Save those as pngs 
+```{r}
+# Rename columns for prettier headers
+top5_superbloom_spatial_summary_renamed <- top5_superbloom_spatial_summary %>%
+  rename(
+    Taxon = taxon_name,
+    `Cells Occupied` = distinctCellsOccupied,
+    `% Total Cells Occupied` = percentOccupied
+  )
+
+# Create the table grob
+tbl_spatial <- tableGrob(top5_superbloom_spatial_summary_renamed, rows = NULL)
+
+# Create the title grob
+title_spatial <- textGrob("Top 5 Spatial Taxa for Superbloom Candidates",
+                           gp = gpar(fontsize = 12, fontface = "bold"))
+
+# Calculate dynamic height of title
+title_height_spatial <- grobHeight(title_spatial) + unit(2, "mm")
+
+# Combine and render
+tbl_spatial_with_title <- arrangeGrob(
+  title_spatial, tbl_spatial,
+  ncol = 1,
+  heights = unit.c(title_height_spatial, unit(1, "npc") - title_height_spatial)
+)
+
+# Save to PNG
+png("/blue/guralnick/millerjared/SuperBlooms/figures/top5_superbloom_spatial_summary.png", width = 400, height = 175)
+grid.draw(tbl_spatial_with_title)
+dev.off()
+
+# Rename columns for prettier headers
+top5_superbloom_temporal_summary_renamed <- top5_superbloom_temporal_summary %>%
+  rename(
+    Taxon = taxon_name,
+    `Week Bins Occupied` = distinctWkBinsOccupied,
+    `% Week Bins Occupied` = percentOccupied
+  )
+
+# Create the table grob
+tbl_temporal <- tableGrob(top5_superbloom_temporal_summary_renamed, rows = NULL)
+
+# Create the title grob
+title_temporal <- textGrob("Top 5 Temporal Taxa for Superbloom Candidates",
+                           gp = gpar(fontsize = 12, fontface = "bold"))
+
+# Calculate dynamic height of title
+title_height_temporal <- grobHeight(title_temporal) + unit(2, "mm")
+
+# Combine and render
+tbl_temporal_with_title <- arrangeGrob(
+  title_temporal, tbl_temporal,
+  ncol = 1,
+  heights = unit.c(title_height_temporal, unit(1, "npc") - title_height_temporal)
+)
+
+# Save to PNG
+png("/blue/guralnick/millerjared/SuperBlooms/figures/top5_superbloom_temporal_summary.png", width = 400, height = 175)
+grid.draw(tbl_temporal_with_title)
+dev.off()
+
+# === Prepare Spatial Table ===
+top5_superbloom_spatial_summary_renamed <- top5_superbloom_spatial_summary %>%
+  rename(
+    Taxon = taxon_name,
+    `Cells Occupied` = distinctCellsOccupied,
+    `% Total Cells Occupied` = percentOccupied
+  )
+
+tbl_spatial <- tableGrob(top5_superbloom_spatial_summary_renamed, rows = NULL)
+title_spatial <- textGrob("Top 5 Spatial Taxa for Superbloom Candidates",
+                          gp = gpar(fontsize = 12, fontface = "bold"))
+title_height_spatial <- grobHeight(title_spatial) + unit(2, "mm")
+
+tbl_spatial_with_title <- arrangeGrob(
+  title_spatial, tbl_spatial,
+  ncol = 1,
+  heights = unit.c(title_height_spatial, unit(1, "npc") - title_height_spatial)
+)
+
+# === Prepare Temporal Table ===
+top5_superbloom_temporal_summary_renamed <- top5_superbloom_temporal_summary %>%
+  rename(
+    Taxon = taxon_name,
+    `Week Bins Occupied` = distinctWkBinsOccupied,
+    `% Week Bins Occupied` = percentOccupied
+  )
+
+tbl_temporal <- tableGrob(top5_superbloom_temporal_summary_renamed, rows = NULL)
+title_temporal <- textGrob("Top 5 Temporal Taxa for Superbloom Candidates",
+                           gp = gpar(fontsize = 12, fontface = "bold"))
+title_height_temporal <- grobHeight(title_temporal) + unit(2, "mm")
+
+tbl_temporal_with_title <- arrangeGrob(
+  title_temporal, tbl_temporal,
+  ncol = 1,
+  heights = unit.c(title_height_temporal, unit(1, "npc") - title_height_temporal)
+)
+
+# === Combine Both Tables Vertically with Consistent Size ===
+combined_tables <- arrangeGrob(
+  tbl_spatial_with_title,
+  tbl_temporal_with_title,
+  ncol = 1,
+  heights = unit.c(unit(1, "npc") * 0.5, unit(1, "npc") * 0.5)  # Each gets 50%
+)
+
+# === Save Final Combined Table ===
+png("/blue/guralnick/millerjared/SuperBlooms/figures/top5_spatial_temporal_combined.png", width = 500, height = 350)
+grid.draw(combined_tables)
+dev.off()
+```
+# Create a jaccard similarity matrix
+```{r}
+#### try some matrix comparisons:
+
+# create an event id by temporal
+select_flowering_superbloomCandidateData  <- select_flowering_superbloomCandidateData  %>% 
+  mutate(event_id = paste(year, week_bin, sep = "_"))
+
+# create a field of lists of taxa per event
+taxa_list <- select_flowering_superbloomCandidateData %>% 
+  distinct(taxon_name, event_id) %>% 
+  group_by(event_id) %>% 
+  summarize(taxa = list(unique(taxon_name)), .groups = "drop")
+
+# do pairwise combinations of events
+event_pairs <- expand.grid(event_id1 = taxa_list$event_id, 
+                           event_id2 = taxa_list$event_id, 
+                           stringsAsFactors = FALSE)
+# calc the shared taxa among events
+compare_fxn <- function(event_id1, event_id2, taxa_list){
+  taxa1 <- taxa_list$taxa[taxa_list$event_id == event_id1][[1]]
+  taxa2 <- taxa_list$taxa[taxa_list$event_id == event_id2][[1]]
+  intersect_taxa <- intersect(taxa1, taxa2)
+  
+  tibble(
+    event_id1 = event_id1, 
+    event_id2 = event_id2, 
+    n_taxa_1 = length(taxa1), 
+    n_taxa_2 = length(taxa2), 
+    n_shared = length(intersect_taxa), 
+    pct_shared_1 = length(intersect_taxa)/length(taxa1),
+    pct_shared_2 = length(intersect_taxa)/length(taxa2)
+  )
+}
+
+comp_tb <- purrr::pmap_dfr(
+  event_pairs,
+  .f = compare_fxn,
+  taxa_list = taxa_list
+)
+
+# create a jaccard similairy index 
+comp_tb <- comp_tb %>% 
+  mutate(jaccard = n_shared / (n_taxa_1 + n_taxa_2 - n_shared))
+
+ggplot(comp_tb, aes(x = event_id1, y = event_id2, fill = jaccard)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "plasma", name = "Jaccard Similarity") +
+  labs(
+    title = "Pairwise Taxonomic Similarity Across Superbloom Events",
+    x = "Event ID",
+    y = "Event ID"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/jaccard-similarity-superbloomEvents.png", width = 14, height = 14)
+
+
+```
+
+

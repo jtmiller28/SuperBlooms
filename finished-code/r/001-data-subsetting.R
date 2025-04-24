@@ -31,10 +31,9 @@ basemap_wgs <- sf::st_read("/blue/guralnick/millerjared/SuperBlooms/data/raw/10m
                             "Sinaloa"))
 # transform the projections to follow equal area
 basemap <- sf::st_transform(basemap_wgs, PROJ_CRS)
-sonoran_shp <- sf::st_transform(sonoran_shp, PROJ_CRS)
-mojave_shp <- sf::st_transform(mojave_shp, PROJ_CRS)
-desert_shps <- st_union(sonoran_shp, mojave_shp) # required step, as we need to assure that the boundaries of the shapefiles do not clip hexcells later in the code. 
-
+desert_shps <- rbind(sonoran_shp, mojave_shp)
+desert_shps <- sf::st_transform(desert_shps, PROJ_CRS)
+desert_shps <- st_combine(desert_shps)
 # Plot the study regions
 ggplot() + 
   geom_sf(data = basemap, fill = "white", color = "black") +  # Basemap layer
@@ -48,6 +47,10 @@ ggplot() +
 
 # Save as SVG
 ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/mojave-sonoran-study-region.svg", 
+       width = 15, height = 10)
+
+# Save as a png 
+ggsave("/blue/guralnick/millerjared/SuperBlooms/figures/mojave-sonoran-study-region.png", 
        width = 15, height = 10)
 # create a hex-cell loop for different grid cell sizes 
 hex_cell_sizes <- c(5,10,25,50,100)
@@ -78,6 +81,7 @@ ggplot() +
     legend.position = "right"  # Adjust legend position if needed
   )
 ggsave(paste0("/blue/guralnick/millerjared/SuperBlooms/figures/", "desert-", hex_cell_sizes[i], "km-grid.svg"),width = 15, height = 10)
+ggsave(paste0("/blue/guralnick/millerjared/SuperBlooms/figures/", "desert-", hex_cell_sizes[i], "km-grid.png"),width = 15, height = 10)
 }
 
 
