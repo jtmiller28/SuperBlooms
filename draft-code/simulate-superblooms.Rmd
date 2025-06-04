@@ -1,0 +1,276 @@
+---
+title: "simulate-superblooms"
+author: "jt-miller"
+date: "2025-06-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+---
+title: "detect-superbloom-simu"
+author: "jt-miller"
+date: "2025-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Try and create the most basic hierarchical model of flowering abundance 
+Assumptions <br>
+- Each year $y$ (for y = 1, ...,30) flowering follows a unimodal phenology curve <br>
+- The number of flowering individuals on day-of-year (DOY) $d$ is normally distributed around a year specific phenological mean  $\mu_y$, with year-specific standard deviation $\sigma_y$ which can represent the duration of flowering(?). <br>
+- The total flowering abundance per year may vary, modeled as a latent year-specific abundance term $N_y$ <br>
+
+Let, <br>
+- $A_{y,d}$ be the abundance of flowering indivduals on day $d$ of year $y$ 
+- $N_y$ be the total flowering abudance in year $y$
+- $\mu_y$ be the mean flowering date for year $y$ 
+- $\sigma_y$ be the duration of flowering period for year $y$ (?)
+
+Math to form a Gaussian phenology curve per year:
+$$
+A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y) \\ 
+where, \\ 
+NormalPDF(d|\mu,\sigma) = \frac{1}{\sqrt2{\pi\sigma}} exp(-\frac{1}{2\sigma^2}(d - \mu)^2)
+$$
+Create a simu of this basic model, note that I'll be using hyperparameters, because peak flowering day (mu_y) and flowering duration (sigma_y) vary across years but are not completely independent. They are samples from higher level (hyper) distributions. These hyperparameters describe the distributions *from which year-specific parameters are drawn*. 
+
+E.g. If most years have peak flowering around doy 100, then we model: 
+$$
+\mu_y \sim Normal(\mu_\mu, \sigma_\mu)
+$$
+where $\mu_\mu$ is the long term average phenological mean, and $\sigma_\mu$ reflects interannual variability. These define the prior distributions for year-level parameters. 
+```{r}
+library(ggplot2)
+library(dplyr)
+ 
+# define simu parms
+n_years <- 30
+days <- 1:365
+
+# set up hyperparms 
+mu_mu <- 100 # average flowering peak across years
+sigma_mu <- 10 # variability in peak flowering phenology across years
+mu_sigma <- 15 # spread/duration of flowering
+sigma_sigma <- 5 # spread/duration of flowering 
+mu_logN <- 9 # log total abundance 
+sigma_logN <- 0.5 # log sigma 
+
+# Simu yearly parms 
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+N_y <- rlnorm(n_years, meanlog = mu_logN, sdlog = sigma_logN) # simulate N_y using a log-normal distribution
+
+
+# Simulate flowering abundance curves per year
+sim.data <- do.call(rbind, lapply(1:n_years, function(y) {
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+  A_yd <- N_y[y] * doy_density
+  
+  data.frame(
+    year = y, 
+    doy = days, 
+    abundance = A_yd
+  )
+}))
+
+# Visualize a subset of years
+sim.data %>% 
+  filter(year %in% c(1,5,10,20, 30)) %>% 
+  ggplot(aes(x = doy, y = abundance, color = factor(year))) +
+  geom_line() +
+  labs(title = "Simu Flowering Abudundance Curves", 
+       x = "Day of Year", y = "Abundance", color = "Year") + 
+    theme_minimal()
+```
+Currently N_y is constructed is such a way that it just randomly draws froma log-normal distribution. This means that we are 'randomly' experiencing high abundance flowering years vs low abundance flowering years. <br>
+
+### We can expand this model (without yet adding biology) by additional latent superbloom indicator parameter S_y. 
+$$
+S_y \sim Bernoulli(p) \\
+log(N_y) = \alpha_0 + \alpha_1 \times S_y \\
+A_{y,d} = N_y \times NormalPDF(d |\mu_y, \sigma_y)
+$$
+Here, we're assuming that there are two different regimes of flowering. Normal years where S_y = 0, such that log(N_y) = alpha_0 resulting in moderate/low abundance of flowering. Superbloom years where S_y = 1, such that log(N_y) = alpha_0 + alpha_1 resulting in high abundance of flowering. This is a two component mixture model on N_y where S_y chooses which distribution to draw from and alpha_1 defines how extreme superblooms are. <br>
+
+We're going to stay in the hyperparameter context, so that we can apply inference methods later. Here, lets define some events <br> 
+
+Let $p_{bloom} \sim Beta(2,8)$ so that each year is sampled like $S_y \sim Bernoulli(p_{bloom})$, so that the expected proportion of superbloom years is 20%
+$$
+E[p_{bloom}] = \frac{2}{2 + 8} = 0.20 
+$$
+```{r}
+# set up parms 
+n_years <- 30
+days <- 1:365
+
+# Hyperparms
+mu_mu <- rnorm(1, mean = 100, sd = 10) # mean DOY peak across years
+sigma_mu <- abs(rnorm(1, mean = 0, sd = 5)) # variability across years
+
+mu_sigma <- rnorm(1, mean = 12, sd = 3) # spread/duration of flowering 
+sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3)) # spread/duration of flowering
+
+alpha_0 <- 9 # means that N_y ~ exp(9) in normal years
+alpha_1 <- 2.5 # means that N_y ~ exp(9 + 2.5) in superbloom years
+
+p_bloom <- rbeta(1, shape1 = 2, shape2 = 8) # beta distribution, the conjugate prior for the Bernoulli and Binomial, should center over 10% probability of superbloom
+
+# year specific parameters
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+S_y <- rbinom(n_years, size = 1, prob = p_bloom) # draw from a binomial distribution for whether this should be a superbloom year, given the probability of the superbloom. 
+
+log_N_y <- alpha_0 + alpha_1 * S_y # Determine log-abundance of flowering
+N_y <- exp(log_N_y) # Exponentiate
+
+# Simulate flowering abundances
+simu.data <- lapply(1:n_years, function(y) {
+  doy <- days
+  curve <- dnorm(doy, mean = mu_y[y], sd = sigma_y[y])
+  abundance <- N_y[y] * curve
+  data.frame(year = y, doy = doy, abundance = abundance, S_y = S_y[y])
+}) %>% bind_rows()
+
+# Normalize data for visualizing 
+simu.data <- simu.data %>% 
+  group_by(year) %>% 
+  mutate(abundance_scaled = abundance/max(abundance)) %>% 
+  ungroup()
+
+# Visualize
+set.seed(1)
+select_years <- sample(1:n_years, 15) # take some random set of years
+
+# Visualize a subset of years
+simu.data %>% 
+  filter(year %in% c(1,2,3,4,5,6,7,8,9,10)) %>% 
+  ggplot(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y))) +
+  geom_line() +
+  scale_linetype_manual(values = c("solid", "dashed"), 
+                        labels = c("Normal", "Superbloom"), 
+                        name = "Bloom type") +
+  labs(title = "Simu Flowering Abudundance Curves", 
+       x = "Day of Year", y = "Abundance", color = "Year") + 
+    theme_minimal()
+
+```
+Now lets start simple, fit to a 2nd degree polynomial model per year
+```{r}
+library(tidyverse)
+
+simu.data_count <- simu.data %>%
+  mutate(count = rpois(n(), lambda = abundance)) %>%  # simulate count data from abundance
+  group_by(year, doy, S_y) %>%
+  summarise(count = sum(count), .groups = "drop")
+# prep doy 
+# Fit a quadratic model per year
+poly_fit <- function(df) {
+  tryCatch({
+    lm(count ~ poly(doy, degree = 2, raw = TRUE), data = df)
+  }, error = function(e) NULL)
+}
+
+model_fits_poly <- simu.data_count %>%
+  group_by(year) %>%
+  nest() %>%
+  mutate(model = map(data, poly_fit))
+```
+
+Compare
+```{r}
+library(broom)
+
+
+model_preds <- model_fits_poly %>%
+  mutate(predicted = map2(model, data, ~ {
+    if (is.null(.x)) return(NULL)
+    augment(.x, newdata = .y)
+  })) %>%
+  unnest(predicted)
+
+years_to_plot <- 1:9
+
+model_preds %>%
+  filter(year %in% years_to_plot) %>%
+  ggplot(aes(x = doy)) +
+  geom_col(aes(y = count), fill = "grey70") +  # histogram bars
+  geom_line(aes(y = .fitted, color = factor(S_y)), size = 1.2) +  # model fit
+  facet_wrap(~ year, scales = "free_y") +
+  scale_color_manual(values = c("0" = "blue", "1" = "red"), 
+                     labels = c("Normal", "Superbloom"),
+                     name = "Bloom Type") +
+  labs(title = "Quadratic Fit on Flowering Count Data per Year",
+       x = "Day of Year", y = "Count") +
+  theme_minimal()
+
+```
+```{r}
+library(tidyverse)
+
+set.seed(1)
+n_years <- 30
+days <- 1:365
+
+# --- Hyperparameters ---
+mu_mu <- rnorm(1, mean = 100, sd = 10) 
+sigma_mu <- abs(rnorm(1, mean = 0, sd = 5)) 
+mu_sigma <- rnorm(1, mean = 12, sd = 3)
+sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+alpha_0 <- 9
+alpha_1 <- 2.5
+p_bloom <- rbeta(1, 2, 8)
+
+# --- Year-specific parameters ---
+mu_y <- rnorm(n_years, mu_mu, sigma_mu)
+sigma_y <- abs(rnorm(n_years, mu_sigma, sigma_sigma))
+S_y <- rbinom(n_years, 1, p_bloom)
+log_N_y <- alpha_0 + alpha_1 * S_y
+N_y <- exp(log_N_y)
+
+# --- Simulate flowering counts ---
+simu.data <- map_dfr(1:n_years, function(y) {
+  lambda_doy <- N_y[y] * dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+  counts <- rpois(length(days), lambda = lambda_doy)
+  tibble(year = y, doy = days, count = counts, S_y = S_y[y])
+})
+
+ggplot(simu.data %>% filter(year %in% 1:9), aes(x = doy, y = count)) +
+  geom_col() +
+  facet_wrap(~ year, scales = "free_y") +
+  theme_minimal()
+```
+Try fitting the model
+```{r}
+# fit a test year
+year_data <- simu.data %>% filter(year == 1)
+x <- glm(count ~ poly(doy, 2, raw = TRUE), family = poisson, data = year_data)
+# Predict the fitted values
+year_data$fitted <- predict(x, type = "response")
+
+# Create a new data frame for the trend line
+trend_line <- data.frame(
+  doy = seq(min(year_data$doy), max(year_data$doy), by = 1),
+  fitted = predict(x, newdata = data.frame(doy = seq(min(year_data$doy), max(year_data$doy), by = 1)), type = "response")
+)
+
+# Create the plot
+ggplot(year_data, aes(x = doy, y = count)) +
+  geom_col() +
+  geom_line(data = trend_line, aes(x = doy, y = fitted), color = "red") +
+  labs(title = "Count Data by Day of Year with Fitted Trend Line",
+       subtitle = "Poisson Regression Model with Quadratic Term",
+       x = "Day of Year",
+       y = "Count") +
+  theme_classic()
+```
+
+
+
+### Adjusting N_y to be influenced by key covariates thought to cause superblooms
+Here, Im adding covariates that will modify N_y such that we have some underyling ecology that triggers such events. 
