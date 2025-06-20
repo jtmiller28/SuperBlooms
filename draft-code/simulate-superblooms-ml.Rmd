@@ -1,0 +1,746 @@
+---
+title: "simulate-superblooms-ml"
+author: "jt-miller"
+date: "2025-06-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Simulate Superblooms and use classic inference with Maximum Likelihood 
+```{r}
+library(tidyverse)
+library(purrr)
+```
+
+### Try and create the most basic hierarchical model of flowering abundance 
+Assumptions <br>
+- Each year $y$ (for y = 1, ...,30) flowering follows a unimodal phenology curve <br>
+- The number of flowering individuals on day-of-year (DOY) $d$ is normally distributed around a year specific phenological mean  $\mu_y$, with year-specific standard deviation $\sigma_y$ which can represent the duration of flowering(?). <br>
+- The total flowering abundance per year may vary, modeled as a latent year-specific abundance term $N_y$ <br>
+
+Let, <br>
+- $A_{y,d}$ be the abundance of flowering indivduals on day $d$ of year $y$ 
+- $N_y$ be the total flowering abudance in year $y$
+- $\mu_y$ be the mean flowering date for year $y$ 
+- $\sigma_y$ be the duration of flowering period for year $y$ (?)
+
+Math to form a Gaussian phenology curve per year:
+$$
+A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y) \\ 
+where, \\ 
+NormalPDF(d|\mu,\sigma) = \frac{1}{\sqrt2{\pi\sigma}} exp(-\frac{1}{2\sigma^2}(d - \mu)^2)
+$$
+Create a simu of this basic model, note that I'll be using hyperparameters, because peak flowering day (mu_y) and flowering duration (sigma_y) vary across years but are not completely independent. They are samples from higher level (hyper) distributions. These hyperparameters describe the distributions *from which year-specific parameters are drawn*. 
+
+E.g. If most years have peak flowering around doy 100, then we model: 
+$$
+\mu_y \sim Normal(\mu_\mu, \sigma_\mu)
+$$
+where $\mu_\mu$ is the long term average phenological mean, and $\sigma_\mu$ reflects interannual variability. These define the prior distributions for year-level parameters. 
+```{r}
+library(ggplot2)
+library(dplyr)
+ 
+# define simu parms
+n_years <- 30
+days <- 1:365
+
+# set up hyperparms 
+mu_mu <- 100 # average flowering peak across years
+sigma_mu <- 10 # variability in peak flowering phenology across years
+mu_sigma <- 15 # spread/duration of flowering
+sigma_sigma <- 5 # spread/duration of flowering 
+mu_logN <- 9 # log total abundance 
+sigma_logN <- 0.5 # log sigma 
+
+# Simu yearly parms 
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+N_y <- rlnorm(n_years, meanlog = mu_logN, sdlog = sigma_logN) # simulate N_y using a log-normal distribution
+
+
+# Simulate flowering abundance curves per year
+sim.data.gen <- do.call(rbind, lapply(1:n_years, function(y) {
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+  A_yd <- N_y[y] * doy_density
+  
+  data.frame(
+    year = y, 
+    doy = days, 
+    abundance = A_yd
+  )
+}))
+
+# Visualize a subset of years
+sim.data.gen %>% 
+  filter(year %in% c(1,5,10,20, 30)) %>% 
+  ggplot(aes(x = doy, y = abundance, color = factor(year))) +
+  geom_line() +
+  labs(title = "Simu Flowering Abudundance Curves", 
+       x = "Day of Year", y = "Abundance", color = "Year") + 
+    theme_minimal()
+```
+
+
+
+### Additionally, we must consider an observation process for these data. Lets go with the simplest, being that we are obtaining count data from a Poisson distribution pull.
+$$
+Counts_{y,d} \sim Poisson(\lambda_{y,d}) \\
+\lambda_{y,d} = A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y)
+$$
+```{r}
+# define temporal parms
+n_years <- 30
+days <- 1:365
+
+# set up simu parms
+mu_mu <- 100 # average flowering peak across years
+sigma_mu <- 20 # variability in peak flowering phenology across years
+mu_sigma <- 15 # spread/duration of flowering
+sigma_sigma <- 5 # spread/duration of flowering 
+mu_logN <- 9 # log total abundance 
+sigma_logN <- 0.5 # log sigma 
+
+# Simu yearly parms 
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+N_y <- rlnorm(n_years, meanlog = mu_logN, sdlog = sigma_logN) # simulate N_y using a log-normal distribution
+
+
+# Simulate count observations 
+sim.data.gen.obs <- purrr::map_dfr(1:n_years, function(y){
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y]) # normal pdf
+  A_yd <- N_y[y] * doy_density # expected abundance 
+  count_obs <- rpois(length(A_yd), lambda = A_yd) # Poisson observation step
+  tibble(
+    year = y, 
+    doy = days, 
+    abundance = A_yd, # true expected abd
+    count_obs = count_obs # observed counts
+  )
+})
+
+# Aggregate over 5 day time bins 
+sim.data.gen.obs.binned <- sim.data.gen.obs %>%
+  mutate(doy_bin = cut(doy, breaks = seq(0, 365, by = 5))) %>%
+  group_by(year, doy_bin) %>%
+  summarise(
+    doy_mid = mean(doy),
+    abundance = sum(abundance),
+    count_obs = sum(count_obs),
+    .groups = "drop"
+  )
+
+bin_width <- 5 # create a binwidth that matches our binned data interval
+sim.data.gen.obs.binned %>%
+  filter(year %in% c(5, 20, 30)) %>%
+  ggplot() +
+  geom_col(aes(x = doy_mid, y = count_obs, fill = factor(year)), 
+           position = "identity", width = bin_width * 0.9, alpha = 0.4) +
+  geom_line(aes(x = doy_mid, y = abundance, color = factor(year)), linewidth = 1) +
+  labs(title = "Flowering Abundance vs Observed Counts (Binned by 5 day increments)",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
+Currently N_y is constructed is such a way that it just randomly draws from a log-normal distribution. This means that we are 'randomly' experiencing high abundance flowering years vs low abundance flowering years. <br>
+
+### We can expand this model (without yet adding biology) by additional latent superbloom indicator parameter S_y. 
+$$
+S_y \sim Bernoulli(p) \\
+log(N_y) = \alpha_0 + \alpha_1 \times S_y \\
+\lambda_{y,d} = A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y) \\
+Counts_{y,d} \sim Poisson(\lambda_{y,d}) \\
+$$
+Here for our data generative model, we're assuming that there are two different regimes of flowering. Normal years where S_y = 0, such that log(N_y) = alpha_0 resulting in moderate/low abundance of flowering. Superbloom years where S_y = 1, such that log(N_y) = alpha_0 + alpha_1 resulting in high abundance of flowering. This is a two component mixture model on N_y where S_y chooses which distribution to draw from and alpha_1 defines how extreme superblooms are. <br>
+
+For the observation model, we're going to retain our random draws from a Poisson distribution to keep things simple for now. 
+```{r}
+# define temporal parms
+n_years <- 30
+days <- 1:365
+
+# set up simu parms
+mu_mu <- 100 # average flowering peak across years
+sigma_mu <- 20 # variability in peak flowering phenology across years
+mu_sigma <- 15 # spread/duration of flowering
+sigma_sigma <- 5 # spread/duration of flowering 
+alpha_0 <- 9 # means that N_y ~ exp(9) in normal years
+alpha_1 <- 2.5 # means that N_y ~ exp(9 + 2.5) in superbloom years
+p_bloom <- 0.20 # the fixed prob of blooming 
+
+# Simu yearly parms 
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+S_y <- rbinom(n_years, size = 1, prob = p_bloom) # latent superbloom indicator variable
+log_N_y <- alpha_0 + alpha_1 * S_y # calc the abd (to be exponentiated) based on whether superbloom occurs or not. 
+N_y <- exp(log_N_y)
+
+# simulate count data with latent superbloom indicator S_y
+sim.latent <- purrr::map_dfr(1:n_years, function(y){
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y]) # pdf over doy 
+  A_yd <- N_y[y] * doy_density # expected abd lambda_{y,d}
+  count_obs <- rpois(length(A_yd), lambda = A_yd) # Poisson count draw
+  # construct summary
+  tibble( 
+    year = y, 
+    doy = days, 
+    mu_y = mu_y[y],
+    sigma_y = sigma_y[y], 
+    S_y = S_y[y], 
+    N_y = N_y[y], 
+    abundance = A_yd, 
+    count_obs = count_obs
+  )
+}
+  )
+
+# Aggregate over 5 day time bins 
+sim.latent.binned <- sim.latent %>%
+  mutate(doy_bin = cut(doy, breaks = seq(0, 365, by = 5))) %>%
+  group_by(year, doy_bin) %>%
+  summarise(
+    doy_mid = mean(doy),
+    abundance = sum(abundance),
+    count_obs = sum(count_obs),
+    S_y = unique(S_y),
+    .groups = "drop"
+  )
+
+bin_width <- 5 # create a binwidth that matches our binned data interval
+sim.latent.binned %>%
+  filter(year %in% c(5, 20, 30)) %>%
+  ggplot() +
+  geom_col(aes(x = doy_mid, y = count_obs, fill = factor(year)), 
+           position = "identity", width = bin_width * 0.9, alpha = 0.4) +
+  geom_line(aes(x = doy_mid, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"), 
+                        labels = c("Normal", "Superbloom"), 
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter is Added \n (Binned by 5 day increments)",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+
+```
+### Fit linear models and make inference 
+Here, I want to test some methods in fitting linear models and trying to use methods from maximum likelihood to derive information. The goal will be to be able to identify what years are superblooms, what the average flowering peak is among years (mu_y), and the variability in peak flowering among years (sigma_y) <br>
+
+Now lets start simple, using basic linear models lets fit a polynomial
+```{r}
+# test a particular year to see if we can fit the model correctly: 
+test.sim.latent <- filter(sim.latent, year == 20)
+
+# fit a polynomial lm to these data (note that raw can be set to FALSE, same solutions but some stuff online about whetehr this is numericall)
+test_poly_fit <- lm(count_obs ~ poly(doy, degree = 2), data = test.sim.latent)
+
+# Predict counts using the fitted model
+test.sim.latent <- test.sim.latent %>%
+  mutate(predicted_count = predict(test_poly_fit, type = "response"))
+# try plotting to see how we did 
+ggplot(test.sim.latent) + 
+  geom_col(mapping = aes(x = doy, y = count_obs), 
+           alpha = 0.4) + 
+  geom_line(mapping = aes(x= doy, y = predicted_count), color = "goldenrod")
+  
+```
+Well thats just terrible, after some reading it appears that the problem is that lms cant deal with zero inflation, which our count data has an abundance of. Lets try seeing if a glm can provide a better fit for these data. 
+```{r}
+# fit a polynomial glm to these data
+glm_test_poly_fit<- glm(count_obs ~ poly(doy, degree = 2), 
+                        family = "poisson",  data = test.sim.latent)
+
+# Predict counts using the fitted model
+test.sim.latent <- test.sim.latent %>%
+  mutate(predicted_count = predict(glm_test_poly_fit, type = "response")) # important to use response here, as it scales our expected counts rather than the log scale counts for the predicted values
+
+ggplot(test.sim.latent) + 
+  geom_col(mapping = aes(x = doy, y = count_obs), 
+           alpha = 0.4) + 
+  geom_line(mapping = aes(x= doy, y = predicted_count), color = "goldenrod")
+
+```
+### Assess Model Fit (Bootstrap)
+
+### Extract mu_y & mu_sigma
+unfortunately with a polynomial, we cannot extract these directly as z_1 and z_2 are orthogonal polynomials, not parameters of the normal pdf
+$$
+log(\lambda_d) = \beta_0 + \beta_1 z_1(doy) + \beta_2z_2(doy)
+$$
+So we can estimate mu_y and sigma_y from the predictions
+```{r}
+# mu_y est is just the maximum value (peak flowering)
+mu_y_hat <- test.sim.latent$doy[which.max(test.sim.latent$predicted_count)] 
+
+# sigma_y is the standard deviation around the peak flowering
+pred <- test.sim.latent$predicted_count
+pred_norm <- pred / sum(pred) # normalize predicted counts
+sigma_y_hat <- sqrt(sum((test.sim.latent$doy - mu_y_hat)^2 * pred_norm))
+
+# How far is this from the truth of the simulated model run?
+mu_y_hat_known <- unique(test.sim.latent$mu_y)
+print(paste(round(((mu_y_hat - mu_y_hat_known)/mu_y_hat_known) * 100, 3), "% error for mu_y estimation"))
+sigma_y_hat_known <- unique(test.sim.latent$sigma_y)
+print(paste(round(((sigma_y_hat - sigma_y_hat_known)/sigma_y_hat_known) * 100, 3), "% error for sigma_y estimation"))
+```
+
+Can we extract the MLEs?
+```{r}
+mles <- coef(glm_test_poly_fit)
+print(mles)
+```
+No...due to the same orthogonal polynomial coefficient issue. Oh well...
+
+Now address whether we can pull out whether S_y = 1 or 0, indicating whether there is a superbloom occurring. Lets tr
+```{r}
+# first, summarize each year in our simulation
+yearly_summary <- sim.latent %>%
+  group_by(year) %>%
+  summarise(
+    total_counts = sum(count_obs),
+    peak_doy = doy[which.max(count_obs)],
+    count_sd = sd(count_obs),
+    S_y = unique(S_y),
+    .groups = "drop"
+  )
+
+glm_superbloom <- glm(S_y ~ total_counts + peak_doy + count_sd,
+                      family = "binomial",
+                      data = yearly_summary)
+
+summary(glm_superbloom)
+
+# predict superblooms via classification on our glm
+yearly_summary <- yearly_summary %>%
+  mutate(
+    S_y_hat_prob = predict(glm_superbloom, type = "response"),
+    S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0)
+  )
+
+# confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+print(paste0((mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100), "% Accuracy in Predicting SuperBlooms")) # overall accuracy
+```
+So under ideal conditions, we can use the total counts, peak flowering in day of year, and the deviation of flowering to infer when superblooms occur according to our model with 100% accuracy. 
+
+### Package this into a function, see how messing with params changes our prediction of superblooms
+```{r}
+sim.latent.fxn <- function(n_years = 30, # number of years to simu
+                         days = 1:365, # doy 
+                         mu_peak = 100, # center for mean flowering
+                         dur = 12, # duration of flowering 
+                         y_var = 0, # variability per year
+                         alpha_0 = 9, # standard bloom
+                         alpha_1 = 2.5, # additional bloom param
+                         p1 = 2, # these two make the expected value 20% 
+                         p2 = 8 
+                         ){
+# define temporal parms
+n_years <- n_years
+days <- days
+
+# set up simu parms (shifting to hyperparameters)
+mu_mu <- rnorm(1, mean = mu_peak, sd = 10) # mean DOY peak across years
+sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5)) # variability across years
+mu_sigma <- rnorm(1, mean = dur, sd = 3) # spread/duration of flowering 
+sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3)) # spread/duration of flowering
+alpha_0 <- alpha_0 # means that N_y ~ exp(9) in normal years
+alpha_1 <- alpha_1 # means that N_y ~ exp(9 + 2.5) in superbloom years
+
+p_bloom <- rbeta(1, shape1 = p1, shape2 = p2) # beta distribution, the conjugate prior for the Bernoulli and Binomial, 
+# year specific parameters
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+S_y <- rbinom(n_years, size = 1, prob = p_bloom) # draw from a binomial distribution for whether this should be a superbloom year, given the probability of the superbloom. 
+
+log_N_y <- alpha_0 + alpha_1 * S_y # Determine log-abundance of flowering
+N_y <- exp(log_N_y) # Exponentiate
+
+# simulate count data with latent superbloom indicator S_y
+sim.latent <- purrr::map_dfr(1:n_years, function(y){
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y]) # pdf over doy 
+  A_yd <- N_y[y] * doy_density # expected abd lambda_{y,d}
+  count_obs <- rpois(length(A_yd), lambda = A_yd) # Poisson count draw
+  # construct summary
+  tibble( 
+    year = y, 
+    doy = days, 
+    mu_y = mu_y[y],
+    sigma_y = sigma_y[y], 
+    S_y = S_y[y], 
+    N_y = N_y[y], 
+    abundance = A_yd, 
+    count_obs = count_obs
+  )
+}
+  )
+return(sim.latent)
+}
+
+check.superbloom.assessment <- function(data = data){
+  # first, summarize each year in our simulation
+yearly_summary <- data %>%
+  group_by(year) %>%
+  summarise(
+    total_counts = sum(count_obs),
+    peak_doy = doy[which.max(count_obs)],
+    count_sd = sd(count_obs),
+    S_y = unique(S_y),
+    .groups = "drop"
+  )
+
+glm_superbloom <- glm(S_y ~ total_counts + peak_doy + count_sd,
+                      family = "binomial",
+                      data = yearly_summary)
+
+# predict superblooms via classification on our glm
+yearly_summary <- yearly_summary %>%
+  mutate(
+    S_y_hat_prob = predict(glm_superbloom, type = "response"),
+    S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0)
+  )
+
+# confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+print(paste0((mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100), "% Accuracy in Predicting SuperBlooms")) # overall accuracy
+return(mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100)
+}
+```
+Check to see what params tweaked change our detection rate of superblooms. 
+```{r eval=FALSE, include=TRUE}
+# try simulating across varying the vars in order to see how these effect our predictive process for superblooms: 
+
+param_grid <- expand.grid(n_years = seq(2, 30, by = 2), 
+                          mu_peak = seq(55, 125, by = 10),
+                          y_var = seq(0, 50, by = 5))
+results_df <- tibble()
+for(i in 1:nrow(param_grid)){
+  params <- param_grid[i, ]
+sim1 <- sim.latent.fxn(n_years = params$n_years, # number of years to simu
+                         days = 1:150, # doy 
+                         mu_peak = params$mu_peak, # center for mean flowering
+                         dur = 12, # duration of flowering 
+                         y_var = params$y_var, # variability per year
+                         alpha_0 = 9, # standard bloom
+                         alpha_1 = 2.5, # additional bloom param
+                         p1 = 2, # these two make the expected value 20% 
+                         p2 = 8 
+                       )  
+
+# try plot 
+# sim1 %>%
+#   filter(year %in% c(5, 10, 15, 20, 30)) %>%
+#   ggplot() +
+#   geom_col(aes(x = doy, y = count_obs, fill = factor(year)), 
+#            position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+#   geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+#   scale_linetype_manual(values = c("solid", "longdash"), 
+#                         labels = c("Normal", "Superbloom"), 
+#                         name = "Bloom type") +
+#   labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter is Added",
+#        x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+#   theme_minimal()
+
+accuracy <- check.superbloom.assessment(data = sim1)
+results_df <- bind_rows(results_df, 
+                        tibble(
+                          n_years = params$n_years, 
+                          mu_peak = params$mu_peak, 
+                          y_var = params$y_var,
+                          accuracy = accuracy
+                        ))
+}
+```
+Now lets start messing with our observation process. Currently we assume a pull from the Poisson distribution. Lets change this by introducing a detection rate, thinning the Poisson count pull.
+$$
+S_y \sim Bernoulli(p) \\
+log(N_y) = \alpha_0 + \alpha_1 \times S_y \\
+\lambda_{y,d} = A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y) \\
+TrueCounts_{y,d} \sim Poisson(\lambda_{y,d}) \\
+ObservedCounts_{y,d} \sim Poisson(pdet_{y,d} \times \lambda_{y,d})
+$$
+Here, the detection probability (pdet) will be a constant we can vary. 
+```{r}
+sim.latent.w.det.fxn <- function(n_years = 30, # number of years to simu
+                         days = 1:365, # doy 
+                         mu_peak = 100, # center for mean flowering
+                         dur = 12, # duration of flowering 
+                         y_var = 0, # variability per year
+                         alpha_0 = 9, # standard bloom
+                         alpha_1 = 2.5, # additional bloom param
+                         pbloom = 0.2, # the prob of superbloom
+                         pdet = 0.5 # the observation rate 
+                         ){
+# define temporal parms
+n_years <- n_years
+days <- days
+
+# set up simu parms (shifting to hyperparameters)
+mu_mu <- rnorm(1, mean = mu_peak, sd = 10) # mean DOY peak across years
+sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5)) # variability across years
+mu_sigma <- rnorm(1, mean = dur, sd = 3) # spread/duration of flowering 
+sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3)) # spread/duration of flowering
+alpha_0 <- alpha_0 # means that N_y ~ exp(9) in normal years
+alpha_1 <- alpha_1 # means that N_y ~ exp(9 + 2.5) in superbloom years
+
+calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+  if (mean <= 0 || mean >= 1) stop("mean must be strictly between 0 and 1")
+  shape1 <- fixed_shape1
+  shape2 <- shape1 * (1 - mean) / mean
+  return(list(pshape1 = shape1, pshape2 = shape2))
+}
+bloom_params <- calibrate_bloom_beta(mean = pbloom, fixed_shape1 = 2)
+p_bloom <- rbeta(1, shape1 = bloom_params$pshape1, shape2 = bloom_params$pshape2) # beta distribution, the conjugate prior for the Bernoulli and Binomial, 
+# year specific parameters
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+S_y <- rbinom(n_years, size = 1, prob = p_bloom) # draw from a binomial distribution for whether this should be a superbloom year, given the probability of the superbloom. 
+
+log_N_y <- alpha_0 + alpha_1 * S_y # Determine log-abundance of flowering
+N_y <- exp(log_N_y) # Exponentiate
+
+# simulate count data with latent superbloom indicator S_y
+sim.latent.det <- purrr::map_dfr(1:n_years, function(y){
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y]) # pdf over doy 
+  A_yd <- N_y[y] * doy_density # expected abd lambda_{y,d}
+  true_count <- rpois(length(A_yd), lambda = A_yd) # Poisson count draw
+  # make an observation process rate
+  # Helper function to calibrate beta distribution for desired mean
+  
+calibrate_beta <- function(mean, fixed_shape1 = 10) { # build a internal fxn that allows for setting the detection rate as a percentage.
+  shape1 <- fixed_shape1
+  shape2 <- shape1 * (1 - mean) / mean
+  return(list(shape1 = shape1, shape2 = shape2))
+}
+beta_params <- calibrate_beta(pdet)  # Allows for input of decimal percentage
+pdet_y <- rbeta(n_years, shape1 = beta_params$shape1, shape2 = beta_params$shape2) # Vary across years, but have an expected value around pdet input
+obs_count <- rpois(length(A_yd), lambda = A_yd * pdet_y[y]) # pull count data with abundance * detection rate. 
+
+# inference level 
+
+  # construct summary
+  tibble( 
+    year = y, 
+    doy = days, 
+    mu_y = mu_y[y],
+    sigma_y = sigma_y[y], 
+    S_y = S_y[y], 
+    N_y = N_y[y], 
+    abundance = A_yd, 
+    true_count = true_count, 
+    obs_count = obs_count
+  )
+}
+  )
+return(sim.latent.det)
+}
+```
+
+```{r}
+sim2 <- sim.latent.w.det.fxn(pbloom = 0.3, pdet = 0.4, n_years = 10, days = 1:150, mu_peak = 90)
+
+# try plot 
+sim2 %>%
+  filter(year %in% c(1,2,3,4,5)) %>%
+  ggplot() +
+  # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
+  #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+  geom_col(aes(x = doy, y = obs_count, fill = factor(year)), 
+           position = "identity", width = bin_width * 0.9, alpha = 0.2) +
+  geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"),
+                        labels = c("Normal", "Superbloom"),
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter & Uniform Imperfect Detection Added",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
+Check detection rates, besides the most extreme case where no obs exist, then we should recover 100% since its uniformly 1/2 the detection.
+```{r}
+check.superbloom.assessment.obs <- function(data = data){
+  # first, summarize each year in our simulation
+yearly_summary <- data %>%
+  group_by(year) %>%
+  summarise(
+    total_obs_counts = sum(obs_count),
+    peak_doy = doy[which.max(total_obs_counts)],
+    obs_count_sd = sd(obs_count),
+    S_y = unique(S_y),
+    .groups = "drop"
+  )
+
+glm_superbloom <- glm(S_y ~ total_obs_counts,
+                      #family = "binomial",
+                      data = yearly_summary)
+
+plot(glm_superbloom)
+
+# predict superblooms via classification on our glm
+yearly_summary <- yearly_summary %>%
+  mutate(
+    S_y_hat_prob = predict(glm_superbloom, type = "response"),
+    S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0)
+  )
+
+# confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+print(paste0((mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100), "% Accuracy in Predicting SuperBlooms")) # overall accuracy
+return(mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100)
+}
+
+check.superbloom.assessment.obs(sim2)
+
+# check for these fixed params with all detection rates:
+det_rate_v <- seq(0, 1, by = 0.05)
+results_df <- tibble()
+for(i in 1:length(det_rate_v)){
+  obs_simu <- sim.latent.w.det.fxn(pdet = det_rate_v[i], pbloom = 0.3, n_years = 1000, days = 1:150, mu_peak = 90)
+  perc_acc <- check.superbloom.assessment.obs(obs_simu)
+  results_df <- bind_rows(results_df, 
+                        tibble(
+                          pdet = det_rate_v[i],
+                          accuracy = perc_acc
+                        ))
+}
+```
+
+### Alternative Method: Z-score Assessment
+Since we're interested in just looking at the density of records (counts), we could try to use z-scores to extract candidate superblooms. This would normalize within year effects, possibly allowing us to extract the potential superblooms (Vaughn's idea). 
+
+Z-scores here will highlight unusually high flowering events relative to the long-term mean at each doy. For a given doy, the z-score is:
+$$
+Z_{y,d} = \frac{obs \ count_{y,d} - \mu_d}{\sigma_d}
+$$
+where, $\mu_d$ is the mean obs count across all years at day $d$
+        $\sigma_d$ is the standard deviation of obs count across all years at day $d$
+        
+However, just doing this would lead to a snag given the structure of our true data. We know that observation effort increases in later years within iNaturalist, which would misrepesent doy densities in recent year datasets. To solve this, I will normalize *within year* using z-scores centered at mu_y. This is will be based on the shape of the observation phenology curve (not raw count magnitudes)
+
+Steps:
+1) Within each year, calc the mean and SD of obs_count around mu_y[y] +/- some window (30 days here)
+2) Standardize obs_count using those values -> local z-score 
+3) Quantify: is the peak z-score near mu_y significantly higher than the rest of the curve? 
+```{r}
+sim_data <- sim.latent.w.det.fxn(pbloom = 0.3, pdet = 1, n_years = 10, days = 1:180, mu_peak = 90) # simulate a sample dataset
+window <- 90 # a window around mu_y to define expected peak region
+# compute per-year centered z-scores
+sim_data_local_z <- sim_data %>% 
+  group_by(year) %>% 
+  mutate(
+    # distance to mu_y for that year
+    dist_to_mu = abs(doy - mu_y[1]), # mu_y is constant per group
+    # only use +/- window days to compute mean/sd
+    mean_in_window = mean(obs_count[dist_to_mu <= window], na.rm = TRUE),
+    sd_in_window = sd(obs_count[dist_to_mu <= window], na.rm = TRUE),
+    # z-score relative to mean/sd in the window around mu_y 
+    local_z = ifelse(sd_in_window > 0, 
+                     (obs_count - mean_in_window) / sd_in_window, 
+                     0)
+  ) %>% 
+  ungroup()
+
+# summarize signal per year
+yearly_peak_signal <- sim_data_local_z %>% 
+  group_by(year, S_y) %>% 
+  summarize(
+    max_local_z = max(local_z, na.rm = TRUE), 
+    mean_local_z = mean(local_z, na.rm = TRUE), 
+    peak_doy = doy[which.max(local_z)], 
+    .groups = "drop"
+  )
+
+# classify superbloom candidates
+threshold <- 2 # arbitrary 
+yearly_peak_signal <- yearly_peak_signal %>% 
+  mutate(predicted_S_y = as.integer(max_local_z > threshold))
+# create a confusion matrix
+table(True = yearly_peak_signal$S_y, 
+      Predicted = yearly_peak_signal$predicted_S_y)
+
+sim_data_local_z %>%
+  filter(year %in% c(2, 10)) %>%
+  ggplot() +
+  # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
+  #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+  geom_col(aes(x = doy, y = obs_count, fill = factor(year)), 
+           position = "identity", width = bin_width * 0.9, alpha = 0.2) +
+  geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"),
+                        labels = c("Normal", "Superbloom"),
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter & Uniform Imperfect Detection Added",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
+
+
+
+### Try adding a spatial component
+Start simple, lets assume that the spatial area is represented by a 10x10 matrix, with detection rates varying *randomly* across them. 
+```{r}
+
+
+# intialize an empty spatial matrix
+spatial_matrix <- matrix(vector("list", 100), nrow = 10, ncol = 10)
+
+# loop through simu
+for(i in 1:10){
+  for(j in 1:10){
+    pdet_random <- runif(1, min = 0, max = 1) # uniform
+    spatial_matrix[[i, j]] <- sim.latent.w.det.fxn(pdet = pdet_random)
+    
+  }
+}
+
+# Create an empty list to hold summaries
+all_summaries <- list()
+
+# Counter for assigning unique ID to each simulation cell
+sim_id <- 1
+
+for (i in 1:10) {
+  for (j in 1:10) {
+    sim_data <- spatial_matrix[[i, j]]
+
+    # Ensure we skip NULL or failed runs
+    if (!is.null(sim_data)) {
+      yearly_summary <- sim_data %>%
+        group_by(year) %>%
+        summarise(
+          total_obs_counts = sum(obs_count, na.rm = TRUE),
+          peak_doy = doy[which.max(obs_count)],  # fixed logic
+          obs_count_sd = sd(obs_count, na.rm = TRUE),
+          S_y = unique(S_y),  # superbloom indicator for the year
+          .groups = "drop"
+        ) %>%
+        mutate(
+          sim_id = sim_id,
+          matrix_row = i,
+          matrix_col = j
+        )
+      
+      all_summaries[[sim_id]] <- yearly_summary
+      sim_id <- sim_id + 1
+    }
+  }
+}
+
+# Combine all into a single dataframe
+yearly_summary_all <- bind_rows(all_summaries)
+
+```
+
+Run a mixed model with accounting for the random effect of matrixID
+```{r}
+library(lme4)
+
+glmm_superbloom <- glmer(S_y ~ total_obs_counts + (1 | sim_id),
+                         family = binomial(), 
+                         data = yearly_summary_all)
+```
+
+
