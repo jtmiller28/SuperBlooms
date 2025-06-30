@@ -12,7 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ## Simulate Superblooms and use classic inference with Maximum Likelihood 
 ```{r}
 library(tidyverse)
-library(purrr)
+library(pROC)
 ```
 
 ### Try and create the most basic hierarchical model of flowering abundance 
@@ -460,7 +460,7 @@ S_y \sim Bernoulli(p) \\
 log(N_y) = \alpha_0 + \alpha_1 \times S_y \\
 \lambda_{y,d} = A_{y,d} = N_y \times NormalPDF(d|\mu_y,\sigma_y) \\
 TrueCounts_{y,d} \sim Poisson(\lambda_{y,d}) \\
-ObservedCounts_{y,d} \sim Poisson(pdet_{y,d} \times \lambda_{y,d})
+ObservedCounts_{y,d} \sim Binomial(TrueCounts_{y,d}, pdet))
 $$
 Here, the detection probability (pdet) will be a constant we can vary. 
 ```{r}
@@ -517,7 +517,7 @@ calibrate_beta <- function(mean, fixed_shape1 = 10) { # build a internal fxn tha
 }
 beta_params <- calibrate_beta(pdet)  # Allows for input of decimal percentage
 pdet_y <- rbeta(n_years, shape1 = beta_params$shape1, shape2 = beta_params$shape2) # Vary across years, but have an expected value around pdet input
-obs_count <- rpois(length(A_yd), lambda = A_yd * pdet_y[y]) # pull count data with abundance * detection rate. 
+obs_count <-rbinom(length(true_count), size = true_count, prob = pdet_y) # pull count data with abundance * detection rate. 
 
 # inference level 
 
@@ -540,7 +540,7 @@ return(sim.latent.det)
 ```
 
 ```{r}
-sim2 <- sim.latent.w.det.fxn(pbloom = 0.3, pdet = 0.4, n_years = 10, days = 1:150, mu_peak = 90)
+sim2 <- sim.latent.w.det.fxn(pbloom = 0.3, pdet = 0.5, n_years = 10, days = 1:150, mu_peak = 90)
 
 # try plot 
 sim2 %>%
@@ -549,7 +549,7 @@ sim2 %>%
   # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
   #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
   geom_col(aes(x = doy, y = obs_count, fill = factor(year)), 
-           position = "identity", width = bin_width * 0.9, alpha = 0.2) +
+           position = "identity", alpha = 0.2) +
   geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
   scale_linetype_manual(values = c("solid", "longdash"),
                         labels = c("Normal", "Superbloom"),
@@ -607,7 +607,6 @@ for(i in 1:length(det_rate_v)){
                         ))
 }
 ```
-
 ### Alternative Method: Z-score Assessment
 Since we're interested in just looking at the density of records (counts), we could try to use z-scores to extract candidate superblooms. This would normalize within year effects, possibly allowing us to extract the potential superblooms (Vaughn's idea). 
 
@@ -618,56 +617,205 @@ $$
 where, $\mu_d$ is the mean obs count across all years at day $d$
         $\sigma_d$ is the standard deviation of obs count across all years at day $d$
         
-However, just doing this would lead to a snag given the structure of our true data. We know that observation effort increases in later years within iNaturalist, which would misrepesent doy densities in recent year datasets. To solve this, I will normalize *within year* using z-scores centered at mu_y. This is will be based on the shape of the observation phenology curve (not raw count magnitudes)
-
-Steps:
-1) Within each year, calc the mean and SD of obs_count around mu_y[y] +/- some window (30 days here)
-2) Standardize obs_count using those values -> local z-score 
-3) Quantify: is the peak z-score near mu_y significantly higher than the rest of the curve? 
+        
 ```{r}
-sim_data <- sim.latent.w.det.fxn(pbloom = 0.3, pdet = 1, n_years = 10, days = 1:180, mu_peak = 90) # simulate a sample dataset
-window <- 90 # a window around mu_y to define expected peak region
-# compute per-year centered z-scores
-sim_data_local_z <- sim_data %>% 
-  group_by(year) %>% 
-  mutate(
-    # distance to mu_y for that year
-    dist_to_mu = abs(doy - mu_y[1]), # mu_y is constant per group
-    # only use +/- window days to compute mean/sd
-    mean_in_window = mean(obs_count[dist_to_mu <= window], na.rm = TRUE),
-    sd_in_window = sd(obs_count[dist_to_mu <= window], na.rm = TRUE),
-    # z-score relative to mean/sd in the window around mu_y 
-    local_z = ifelse(sd_in_window > 0, 
-                     (obs_count - mean_in_window) / sd_in_window, 
-                     0)
-  ) %>% 
-  ungroup()
+  sim_data <- sim.latent.w.det.fxn(n_years = 10,days = 1:150, mu_peak = 100, pbloom = 0.2, y_var = 10)
+  # Compute mean and sd per doy 
+  obs_stats <- sim_data %>% 
+    group_by(doy) %>% 
+    summarize(
+      mean_obs = mean(obs_count), 
+      sd_obs = sd(obs_count), 
+      .groups = "drop"
+    )
+  
+  # join and compute the z-scores
+  sim_z_obs <- sim_data %>% 
+    left_join(obs_stats, by = "doy") %>% 
+    mutate(
+      z_obs = (obs_count - mean_obs) / sd_obs
+    )
+  
+  # summarize at year level, here we can use mean z-score or total z-score (per year), the total will better reflect shape and size
+  z_summary <- sim_z_obs %>% 
+    group_by(year) %>% 
+    summarize(
+      total_z = sum(z_obs, na.rm = TRUE),
+      mean_z =  mean(z_obs, na.rm = TRUE), 
+      S_y = unique(S_y), 
+      .groups = "drop"
+    )
+  
+  # detection of z-score outliers 
+  z_cutoff <- mean(z_summary$total_z) + 1 * sd(z_summary$total_z)
+  z_summary <- z_summary %>% 
+    mutate(
+      classified_superbloom = total_z > z_cutoff
+    )
+  
+  
+  
+  ggplot(z_summary, aes(x = total_z, fill = as.factor(S_y))) +
+    geom_density(alpha = 0.6) +
+    geom_vline(xintercept = z_cutoff, linetype = "dashed", color = "red") +
+    labs(title = "Distribution of Total Z by True Bloom Status",
+         fill = "S_y")
+  table(z_summary$S_y, z_summary$classified_superbloom)
+```
+```{r}
+sim_data <- sim.latent.w.det.fxn(n_years = 7,days = 1:150, mu_peak = 100, pbloom = 0.42, y_var = 0)
+# Set a z-score threshold and minimum number of outlier DOYs
+z_thresh <- 2
+min_outlier_doys <- 20
 
-# summarize signal per year
-yearly_peak_signal <- sim_data_local_z %>% 
-  group_by(year, S_y) %>% 
+  obs_stats <- sim_data %>% 
+    group_by(doy) %>% 
+    summarize(
+      mean_obs = mean(obs_count), 
+      sd_obs = sd(obs_count), 
+      .groups = "drop"
+    )
+  
+  # join and compute the z-scores
+  sim_z_obs <- sim_data %>% 
+    left_join(obs_stats, by = "doy") %>% 
+    mutate(
+      z_obs = (obs_count - mean_obs) / sd_obs
+    )
+
+# Identify DOY-level outliers
+sim_z_obs <- sim_z_obs %>%
+  mutate(
+    outlier_doy = z_obs > z_thresh
+  )
+
+# Count number of outlier DOYs per year
+year_outlier_counts <- sim_z_obs %>%
+  group_by(year) %>%
   summarize(
-    max_local_z = max(local_z, na.rm = TRUE), 
-    mean_local_z = mean(local_z, na.rm = TRUE), 
-    peak_doy = doy[which.max(local_z)], 
+    n_outlier_doys = sum(outlier_doy, na.rm = TRUE),
+    S_y = unique(S_y),  # keep bloom status
+    .groups = "drop"
+  ) %>%
+  mutate(
+    classified_superbloom = n_outlier_doys >= min_outlier_doys
+  )
+
+# Visualize
+ggplot(year_outlier_counts, aes(x = n_outlier_doys, fill = as.factor(S_y))) +
+  geom_histogram(binwidth = 1, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = min_outlier_doys, linetype = "dashed", color = "red") +
+  labs(title = "Number of Outlier DOYs per Year",
+       x = "Number of DOYs with Z > 2",
+       fill = "True Superbloom Status (S_y)")
+
+# Check performance
+table(year_outlier_counts$S_y, year_outlier_counts$classified_superbloom)
+```
+
+
+Additionally, we'll use an ROC curve to create the threshold of detection for superblooms. 
+```{r}
+sim_data <- sim.latent.w.det.fxn(n_years = 100)
+
+# compute per-DOY stats from observed counts (across all years)
+obs_stats <- sim_data %>% 
+  group_by(doy) %>% 
+  summarize(
+    mean_obs = mean(obs_count), 
+    sd_obs = sd(obs_count), 
     .groups = "drop"
   )
 
-# classify superbloom candidates
-threshold <- 2 # arbitrary 
-yearly_peak_signal <- yearly_peak_signal %>% 
-  mutate(predicted_S_y = as.integer(max_local_z > threshold))
-# create a confusion matrix
-table(True = yearly_peak_signal$S_y, 
-      Predicted = yearly_peak_signal$predicted_S_y)
+# join stats to original data and compute z-scores
+sim_z_obs <- sim_data %>% 
+  left_join(obs_stats, by = "doy") %>% 
+  mutate(
+    z_obs = (obs_count - mean_obs) / sd_obs
+  )
+# try using a ROC curve to generate the best case detection threshold for our z-score
+sim_z_summary <- sim_z_obs %>% 
+  group_by(year, S_y) %>% 
+  summarize(mean_z_obs = mean(z_obs, na.rm = TRUE), .groups = "drop")
 
-sim_data_local_z %>%
-  filter(year %in% c(2, 10)) %>%
+# try building an ROC curve 
+roc_curve <- roc(sim_z_summary$S_y, sim_z_summary$mean_z_obs)
+plot(roc_curve)
+auc(roc_curve)
+# choose optimal 
+thresh <- as.numeric(coords(roc_curve, "best", ret = "threshold"))
+
+# create a classifier at the year level 
+classifier_obs <- sim_z_obs %>% 
+  group_by(year, S_y) %>% 
+  summarize(
+    mean_z_obs = mean(z_obs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    classified_superbloom = ifelse(mean_z_obs > thresh, 1, 0)
+  )
+
+# eval classifier 
+confusion_matrix_obs <- table(True = classifier_obs$S_y, 
+                              Predicted = classifier_obs$classified_superbloom)
+
+confusion_matrix_obs
+```
+While this certaintly works well, its not useful when considering that we're trying to predict superblooms from untrained data. Technically we could use this if the simulation was realistic...that would require some parameterization. Lets try additional methods instead.
+
+Use Mixture Modeling on Z-scores
+Assume two latent distributions (superbloom vs normal) and fit a mixture model to the annual mean_z_obs values
+```{r}
+library(mclust)
+# run simu
+sim_data <- sim.latent.w.det.fxn(n_years = 10)
+
+obs_stats <- sim_data %>%
+  group_by(doy) %>%
+  summarize(
+    mean_obs = mean(obs_count), 
+    sd_obs = sd(obs_count), 
+    .groups = "drop"
+  )
+
+sim_z_obs <- sim_data %>%
+  left_join(obs_stats, by = "doy") %>%
+  mutate(
+    z_obs = (obs_count - mean_obs) / sd_obs
+  )
+
+# First: Compute year-level z-scores
+sim_z_summary <- sim_z_obs %>%
+  group_by(year, S_y) %>%
+  summarize(mean_z_obs = mean(z_obs, na.rm = TRUE), .groups = "drop")
+
+# Extract numeric vector for clustering
+mean_z_obs <- sim_z_summary$mean_z_obs
+
+
+# Fit Gaussian mixture model
+library(mclust)
+model <- Mclust(mean_z_obs, G = 2)
+
+# Store predictions
+sim_z_summary$predicted_class <- model$classification
+
+# change factors to match previous notation (0 = regular bloom, 1 = superbloom)
+sim_z_summary <- sim_z_summary %>% 
+  mutate(predicted_bloom_class = ifelse(predicted_class == 1, 0, 1))
+
+table(sim_z_summary$S_y, sim_z_summary$predicted_bloom_class,
+      dnn = c("True Superbloom (S_y)", "Predicted Class"))
+
+# try plot 
+sim_data %>%
+  filter(year %in% c(7,8)) %>%
   ggplot() +
   # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
   #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
   geom_col(aes(x = doy, y = obs_count, fill = factor(year)), 
-           position = "identity", width = bin_width * 0.9, alpha = 0.2) +
+           position = "identity", alpha = 0.2) +
   geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
   scale_linetype_manual(values = c("solid", "longdash"),
                         labels = c("Normal", "Superbloom"),
@@ -676,71 +824,533 @@ sim_data_local_z %>%
        x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
   theme_minimal()
 ```
-
-
-
-### Try adding a spatial component
-Start simple, lets assume that the spatial area is represented by a 10x10 matrix, with detection rates varying *randomly* across them. 
+Try with a glm 
 ```{r}
+sim_data <- sim.latent.w.det.fxn(n_years = 100, pbloom = 0.2)
 
+sim_data_summary <- sim_data %>% 
+  group_by(year) %>% 
+  mutate(S_y = unique(S_y)) %>% 
+  select(year, S_y)
+# fit the glm 
+glm_model <- glm(obs_count ~ poly(doy, degree = 2), 
+                 family = "poisson", 
+                 data = sim_data)
 
-# intialize an empty spatial matrix
-spatial_matrix <- matrix(vector("list", 100), nrow = 10, ncol = 10)
+summary(glm_model)
 
-# loop through simu
-for(i in 1:10){
-  for(j in 1:10){
-    pdet_random <- runif(1, min = 0, max = 1) # uniform
-    spatial_matrix[[i, j]] <- sim.latent.w.det.fxn(pdet = pdet_random)
-    
-  }
-}
+sim_data <- sim_data %>% 
+  mutate(residuals = glm_model$residuals)
 
-# Create an empty list to hold summaries
-all_summaries <- list()
+year_residuals <- sim_data %>% 
+  group_by(year) %>% 
+  summarize(
+    mean_residual = mean(residuals),
+    .groups = "drop"
+  )
 
-# Counter for assigning unique ID to each simulation cell
-sim_id <- 1
+mean_res <- mean(year_residuals$mean_residual)
+sd_res <- sd(year_residuals$mean_residual)
 
-for (i in 1:10) {
-  for (j in 1:10) {
-    sim_data <- spatial_matrix[[i, j]]
+# Set threshold
+threshold <- mean_res + 2 * sd_res
 
-    # Ensure we skip NULL or failed runs
-    if (!is.null(sim_data)) {
-      yearly_summary <- sim_data %>%
-        group_by(year) %>%
-        summarise(
-          total_obs_counts = sum(obs_count, na.rm = TRUE),
-          peak_doy = doy[which.max(obs_count)],  # fixed logic
-          obs_count_sd = sd(obs_count, na.rm = TRUE),
-          S_y = unique(S_y),  # superbloom indicator for the year
-          .groups = "drop"
-        ) %>%
-        mutate(
-          sim_id = sim_id,
-          matrix_row = i,
-          matrix_col = j
-        )
-      
-      all_summaries[[sim_id]] <- yearly_summary
-      sim_id <- sim_id + 1
-    }
-  }
-}
+year_residuals <- year_residuals %>% 
+  mutate(superbloom_classified = ifelse(mean_residual > threshold, 1, 0))
 
-# Combine all into a single dataframe
-yearly_summary_all <- bind_rows(all_summaries)
+# Merge with true bloom status
+classification_results <- year_residuals %>% 
+  select(year, superbloom_classified, S_y) %>% 
+  left_join(sim_data_summary, by = "year") %>% 
+  distinct()
 
+# Create confusion matrix
+confusion_matrix <- table(classification_results$superbloom_classified, 
+                         classification_results$S_y)
+
+print(confusion_matrix)
 ```
 
-Run a mixed model with accounting for the random effect of matrixID
-```{r}
-library(lme4)
 
-glmm_superbloom <- glmer(S_y ~ total_obs_counts + (1 | sim_id),
-                         family = binomial(), 
-                         data = yearly_summary_all)
+
+
+
+### Add in temporal trend in detection
+Adjust pdet so that it increases in later years to mimic iNaturalist data 
+```{r}
+sim.latent.w.inc.det <- function(n_years = 30, # number of years to simu
+                         days = 1:365, # doy 
+                         mu_peak = 100, # center for mean flowering
+                         dur = 12, # duration of flowering 
+                         y_var = 0, # variability per year
+                         alpha_0 = 9, # standard bloom
+                         alpha_1 = 2.5, # additional bloom param
+                         pbloom = 0.2, # the prob of superbloom
+                         min_det = 0.2,
+                         max_det = 0.8# the observation rate 
+                         ){
+# define temporal parms
+n_years <- n_years
+days <- days
+
+# set up simu parms (shifting to hyperparameters)
+mu_mu <- rnorm(1, mean = mu_peak, sd = 10) # mean DOY peak across years
+sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5)) # variability across years
+mu_sigma <- rnorm(1, mean = dur, sd = 3) # spread/duration of flowering 
+sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3)) # spread/duration of flowering
+alpha_0 <- alpha_0 # means that N_y ~ exp(9) in normal years
+alpha_1 <- alpha_1 # means that N_y ~ exp(9 + 2.5) in superbloom years
+
+calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+  if (mean <= 0 || mean >= 1) stop("mean must be strictly between 0 and 1")
+  shape1 <- fixed_shape1
+  shape2 <- shape1 * (1 - mean) / mean
+  return(list(pshape1 = shape1, pshape2 = shape2))
+}
+bloom_params <- calibrate_bloom_beta(mean = pbloom, fixed_shape1 = 2)
+p_bloom <- rbeta(1, shape1 = bloom_params$pshape1, shape2 = bloom_params$pshape2) # beta distribution, the conjugate prior for the Bernoulli and Binomial, 
+# year specific parameters
+mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu) # draw each year's flowering mean mu_y for Normal Distributions defined by the hyperparameters mu_mu & sigma_mu
+sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma)) # draw each year's standard deviation sigma_y from Normal distributions defined by the hyperparameters mu_sigma and sigma_sigma
+S_y <- rbinom(n_years, size = 1, prob = p_bloom) # draw from a binomial distribution for whether this should be a superbloom year, given the probability of the superbloom. 
+
+log_N_y <- alpha_0 + alpha_1 * S_y # Determine log-abundance of flowering
+N_y <- exp(log_N_y) # Exponentiate
+
+# simulate count data with latent superbloom indicator S_y
+sim.latent.det <- purrr::map_dfr(1:n_years, function(y){
+  doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y]) # pdf over doy 
+  A_yd <- N_y[y] * doy_density # expected abd lambda_{y,d}
+  true_count <- rpois(length(A_yd), lambda = A_yd) # Poisson count draw
+  # Helper function to calibrate beta distribution for desired mean
+  
+calibrate_beta <- function(mean, fixed_shape1 = 10) { # build a internal fxn that allows for setting the detection rate as a percentage.
+  shape1 <- fixed_shape1
+  shape2 <- shape1 * (1 - mean) / mean
+  return(list(shape1 = shape1, shape2 = shape2))
+}
+# beta_params <- calibrate_beta(pdet)  # Allows for input of decimal percentage
+# pdet_y <- rbeta(n_years, shape1 = beta_params$shape1, shape2 = beta_params$shape2) # Vary across years, but have an expected value around pdet input
+# create trend of sampling throughout the years
+pdet_trend <- seq(min_det, max_det, length.out = n_years)
+# calibrate detection per year
+pdet_y <- map_dbl(pdet_trend, function(p) {
+  beta_params <- calibrate_beta(p)
+  rbeta(1, shape1 = beta_params$shape1, shape2 = beta_params$shape2)
+})
+
+obs_count <-rbinom(length(true_count), size = true_count, prob = pdet_y[y]) # pull count data with abundance * detection rate. 
+
+# inference level 
+
+  # construct summary
+  tibble( 
+    year = y, 
+    doy = days, 
+    mu_y = mu_y[y],
+    sigma_y = sigma_y[y], 
+    S_y = S_y[y], 
+    N_y = N_y[y], 
+    abundance = A_yd, 
+    true_count = true_count, 
+    obs_count = obs_count, 
+    pdet_y[y]
+  )
+}
+  )
+return(sim.latent.det)
+}
+```
+Try simu
+```{r}
+set.seed(123)
+simu_det <- sim.latent.w.inc.det(min_det = 0.1, max_det = 0.4, pbloom = 0.05)
+# compute per-DOY stats from observed counts (across all years)
+obs_stats <- simu_det %>% 
+  group_by(doy) %>% 
+  summarize(
+    mean_obs = mean(obs_count), 
+    sd_obs = sd(obs_count), 
+    .groups = "drop"
+  )
+
+# join stats to original data and compute z-scores
+sim_z_obs <- simu_det %>% 
+  left_join(obs_stats, by = "doy") %>% 
+  mutate(
+    z_obs = (obs_count - mean_obs) / sd_obs
+  )
+# try using a ROC curve to generate the best case detection threshold for our z-score
+sim_z_summary <- sim_z_obs %>% 
+  group_by(year, S_y) %>% 
+  summarize(mean_z_obs = mean(z_obs, na.rm = TRUE), .groups = "drop")
+
+# try building an ROC curve 
+roc_curve <- roc(sim_z_summary$S_y, sim_z_summary$mean_z_obs)
+plot(roc_curve)
+auc(roc_curve)
+# choose optimal 
+thresh <- as.numeric(coords(roc_curve, "best", ret = "threshold"))
+
+# create a classifier at the year level 
+classifier_obs <- sim_z_obs %>% 
+  group_by(year, S_y) %>% 
+  summarize(
+    mean_z_obs = mean(z_obs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    classified_superbloom = ifelse(mean_z_obs > thresh, 1, 0)
+  )
+
+# eval classifier 
+confusion_matrix_obs <- table(True = classifier_obs$S_y, 
+                              Predicted = classifier_obs$classified_superbloom)
+
+confusion_matrix_obs
 ```
 
+
+Try a linear model to find the obs trend overtime and use this to weight 
+```{r}
+# fit a model of expected total obs over time
+effort_model <- lm(total_obs ~ year, data = effort_by_year)
+
+# Predict effort baseline
+effort_by_year$expected_obs <- predict(effort_model)
+
+# compute effort index 
+effort_by_year$effort_index <- effort_by_year$total_obs / effort_by_year$expected_obs
+
+# Join effort back in and normalize obs_count 
+sim_data_effort <- sim_data %>% 
+  left_join(effort_by_year, by = "year") %>% 
+  mutate(obs_effort_norm = obs_count / effort_index)
+
+# try running
+# compute cross-year z-scores per doy 
+sim_data_z <- sim_data_effort %>% 
+  group_by(doy) %>% 
+  mutate(
+    mean_doy = mean(obs_effort_norm, na.rm = TRUE), 
+    sd_doy = sd(obs_effort_norm, na.rm = TRUE), 
+    z_score = ifelse(sd_doy > 0, 
+                     (obs_effort_norm - mean_doy) / sd_doy, 
+                     0)
+  )
+
+# summarize by year
+yearly_z_summary <- sim_data_z %>% 
+  group_by(year, S_y) %>% 
+  summarize(
+    sum_z = sum(z_score, na.rm = TRUE), 
+    max_z = max(z_score, na.rm = TRUE), 
+    .groups = "drop"
+  )
+
+yearly_z_summary %>%
+  mutate(predicted_S_y = as.integer(sum_z > 3)) %>%
+  count(True = S_y, Predicted = predicted_S_y)
+```
+
+### Create a Spatial Matrix to mimic sampling across space
+Here we'll assume that the data generated is what consitutes to the general geographic space, and that sampling across this space differs
+```{r}
+sim.latent.w.det.spatial <- function(n_years = 30,
+                                     days = 1:150,
+                                     mu_peak = 100,
+                                     dur = 12,
+                                     y_var = 0,
+                                     alpha_0 = 9,
+                                     alpha_1 = 2.5,
+                                     pbloom = 0.2,
+                                     pdet = 0.5,
+                                     grid_n = 5) {
+  # Temporal hyperparameters
+  mu_mu <- rnorm(1, mean = mu_peak, sd = 10)
+  sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5))
+  mu_sigma <- rnorm(1, mean = dur, sd = 3)
+  sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+
+  # Superbloom probability
+  calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(pshape1 = shape1, pshape2 = shape2)
+  }
+  bloom_params <- calibrate_bloom_beta(mean = pbloom)
+  p_bloom <- rbeta(1, shape1 = bloom_params$pshape1, shape2 = bloom_params$pshape2)
+
+  # Year-specific flowering parameters
+  mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu)
+  sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma))
+  S_y <- rbinom(n_years, 1, prob = p_bloom)
+  log_N_y <- alpha_0 + alpha_1 * S_y
+  N_y <- exp(log_N_y)
+
+  # Precompute shared true counts (same across space)
+  true_data <- purrr::map_dfr(1:n_years, function(y) {
+    doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+    A_yd <- N_y[y] * doy_density
+    true_count <- rpois(length(A_yd), lambda = A_yd)
+    tibble(year = y, doy = days, true_count = true_count, abundance = A_yd,
+           mu_y = mu_y[y], sigma_y = sigma_y[y], S_y = S_y[y], N_y = N_y[y])
+  })
+
+  # Generate spatially varying detection rates
+  calibrate_beta <- function(mean, fixed_shape1 = 10) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(shape1 = shape1, shape2 = shape2)
+  }
+  beta_params <- calibrate_beta(pdet)
+
+  spatial_grid <- expand.grid(x = 1:grid_n, y = 1:grid_n) %>%
+    mutate(cell_id = paste0("cell_", x, "_", y),
+           pdet = rbeta(n = n(), shape1 = beta_params$shape1, shape2 = beta_params$shape2))
+
+  # Simulate observed counts for each spatial cell
+  sim_obs <- purrr::map_dfr(1:nrow(spatial_grid), function(i) {
+    cell <- spatial_grid[i, ]
+    pdet_c <- cell$pdet
+
+    true_data %>%
+      mutate(obs_count = rbinom(n(), size = true_count, prob = pdet_c),
+             cell_id = cell$cell_id,
+             x = cell$x,
+             y = cell$y,
+             pdet = pdet_c)
+  })
+
+  return(sim_obs)
+}
+```
+
+Run simulation
+```{r}
+spatial_sim <- sim.latent.w.det.spatial(pbloom = 0.2, pdet = 0.5, grid_n = 5) # ngrid is 5x5 = 25 spatial cells
+
+# create a visual for comparison 
+spatial_sim %>%
+  filter(year %in% c(1)) %>%
+  ggplot() +
+  # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
+  #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+  geom_col(aes(x = doy, y = obs_count, fill = factor(cell_id)), 
+           position = "identity", alpha = 0.1) +
+  geom_line(aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"),
+                        labels = c("Normal", "Superbloom"),
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter & Uniform Imperfect Detection Added \n Across Spatial Cells",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
+
+
+
+
+### Testing more stuff
+```{r}
+sim_data <- sim.latent.w.det.fxn(n_years = 100)
+sim_data_weekly <- sim_data %>%
+  mutate(week = ceiling(doy / 7)) %>%
+  group_by(year, week) %>%
+  summarize(weekly_obs = sum(obs_count), .groups = "drop")
+
+features <- sim_data_weekly %>%
+  group_by(year) %>%
+  summarize(
+    total_obs = sum(weekly_obs),
+    peak_week = week[which.max(weekly_obs)],
+    peak_val = max(weekly_obs),
+    spread = sd(weekly_obs),
+    entropy = -sum((weekly_obs / sum(weekly_obs)) * log((weekly_obs + 1e-10) / sum(weekly_obs))),
+    .groups = "drop"
+)
+
+true_labels <- sim_data %>%
+  select(year, S_y) %>%
+  distinct()
+
+features <- left_join(features, true_labels, by = "year")
+
+model <- glm(S_y ~ total_obs, 
+             data = features, 
+             family = "binomial")
+
+features$predicted_prob <- predict(model, type = "response")
+features$predicted_class <- as.integer(features$predicted_prob > 0.5)
+
+# Confusion matrix
+table(Predicted = features$predicted_class, Actual = features$S_y)
+library(pROC)
+roc_obj <- roc(features$S_y, features$predicted_prob)
+auc(roc_obj)
+
+gmm <- Mclust(features$total_obs, G = 2)
+features$gmm_class <- gmm$classification
+
+```
+```{r}
+sim_data <- sim.latent.w.inc.det(n_years = 100, y_var = 0)
+# first, summarize each year in our simulation
+yearly_summary <- sim_data %>%
+  group_by(year) %>%
+  summarise(
+    obs_counts = sum(obs_count),
+    peak_doy = doy[which.max(obs_count)],
+    count_sd = sd(obs_count),
+    S_y = unique(S_y),
+    .groups = "drop"
+  )
+
+glm_superbloom <- glm(S_y ~ obs_counts + peak_doy + count_sd,
+                      family = "binomial",
+                      data = yearly_summary)
+
+summary(glm_superbloom)
+
+# predict superblooms via classification on our glm
+yearly_summary <- yearly_summary %>%
+  mutate(
+    S_y_hat_prob = predict(glm_superbloom, type = "response"),
+    S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0)
+  )
+
+# confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+print(paste0((mean(yearly_summary$S_y == yearly_summary$S_y_hat)*100), "% Accuracy in Predicting SuperBlooms")) # overall accuracy
+```
+
+```{r}
+# Define the function
+sim.latent.w.det.spatial2 <- function(
+  n_years = 30,
+  days = 1:150,
+  mu_peak = 100,
+  dur = 12,
+  y_var = 0,
+  alpha_0 = 9,
+  alpha_1 = 2.5,
+  pbloom = 0.2,
+  pdet = 0.5,
+  grid_n = 5,
+  dirichlet_conc = 1e6 # smaller = more uneven site abundances
+) {
+  # Temporal hyperparameters
+  mu_mu <- rnorm(1, mean = mu_peak, sd = 10)
+  sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5))
+  mu_sigma <- rnorm(1, mean = dur, sd = 3)
+  sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+
+  # Superbloom probability
+  calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(pshape1 = shape1, pshape2 = shape2)
+  }
+  bloom_params <- calibrate_bloom_beta(mean = pbloom)
+  p_bloom <- rbeta(1, shape1 = bloom_params$pshape1, shape2 = bloom_params$pshape2)
+
+  # Year-specific flowering parameters
+  mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu)
+  sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma))
+  S_y <- rbinom(n_years, 1, prob = p_bloom)
+  log_N_y <- alpha_0 + alpha_1 * S_y
+  N_y <- exp(log_N_y)
+
+  # Spatial grid
+  calibrate_beta <- function(mean, fixed_shape1 = 10) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(shape1 = shape1, shape2 = shape2)
+  }
+  beta_params <- calibrate_beta(pdet)
+  spatial_grid <- expand.grid(x = 1:grid_n, y = 1:grid_n) %>%
+    mutate(
+      cell_id = paste0("cell_", x, "_", y),
+      pdet = rbeta(n = n(), shape1 = beta_params$shape1, shape2 = beta_params$shape2)
+    )
+
+  n_cells <- nrow(spatial_grid)
+
+  # Generate data for each year
+  sim_obs <- purrr::map_dfr(1:n_years, function(y) {
+    # Daily expected abundance (density)
+    doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+
+    # Dirichlet proportions across cells
+    prop_cells <- MCMCpack::rdirichlet(1, rep(dirichlet_conc, n_cells))[1,]
+
+    # For each cell
+    daily_results <- purrr::map_dfr(1:n_cells, function(i) {
+      cell <- spatial_grid[i, ]
+      pdet_c <- cell$pdet
+      prop_c <- prop_cells[i]
+
+      # Expected abundance curve for this cell
+      A_d_c <- N_y[y] * prop_c * doy_density
+
+      # Simulate counts
+      true_count <- rpois(length(A_d_c), lambda = A_d_c)
+      obs_count <- rbinom(length(A_d_c), size = true_count, prob = pdet_c)
+
+      tibble(
+        year = y,
+        doy = days,
+        true_count = true_count,
+        obs_count = obs_count,
+        abundance = A_d_c,
+        mu_y = mu_y[y],
+        sigma_y = sigma_y[y],
+        S_y = S_y[y],
+        N_y = N_y[y],
+        cell_id = cell$cell_id,
+        x = cell$x,
+        y = cell$y,
+        pdet = pdet_c,
+        prop_abundance = prop_c
+      )
+    })
+
+    # Compute total true count per year & doy
+    totals <- daily_results %>%
+      group_by(year, doy) %>%
+      summarize(
+        true_count_total = sum(true_count),
+        abundance_total = sum(abundance),
+        .groups = "drop"
+      )
+
+    # Join back
+    daily_results %>%
+      left_join(totals, by = c("year", "doy"))
+  })
+
+  return(sim_obs)
+}
+```
+
+```{r}
+library(MCMCpack)
+spatial_sim <- sim.latent.w.det.spatial2(pbloom = 0.2, pdet = 0.5, grid_n = 5) # ngrid is 5x5 = 25 spatial cells
+
+# create a visual for comparison 
+spatial_sim %>%
+  filter(year %in% c(1)) %>%
+  ggplot() +
+  # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
+  #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+  geom_col(aes(x = doy, y = obs_count, fill = factor(cell_id)), 
+           position = "stack", alpha = 0.9) +
+  geom_line(aes(x = doy, y = abundance_total, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"),
+                        labels = c("Normal", "Superbloom"),
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter & Uniform Imperfect Detection Added \n Across Spatial Cells",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
 
