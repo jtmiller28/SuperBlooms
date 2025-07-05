@@ -14,6 +14,7 @@ A second markdown more focused on the detection aspect of the simulations
 Load Packages
 ```{r}
 library(tidyverse)
+library(MCMCpack)
 ```
 Our current n-mixture model for generating abundance for superblooms, then pulling from it as a count process. 
 $$
@@ -283,8 +284,8 @@ return(sim.latent.det)
 ```
 
 ```{r}
-#set.seed(872)
-simu_data <- sim.latent.w.inc.det(n_years = 10, days = 1:150, dur = 12, y_var = 10, alpha_0 = 9, alpha_1 = 1) # simulate 10 years with 150 days (beginning of year to roughly end of spring)
+set.seed(872)
+simu_data <- sim.latent.w.inc.det(n_years = 100, days = 1:150, dur = 12, y_var = 10, alpha_1 = 1)# simulate 10 years with 150 days (beginning of year to roughly end of spring)
 # visualize
 simu_data %>%
   filter(year %in% c(1,2,3,4,5,7,8,9,10)) %>%
@@ -332,6 +333,8 @@ yearly_summary <- simu_data_weekly %>%
 glm_superbloom <- glm(S_y ~ year_obs_sum + peak_week + count_sd,
                       family = "binomial", data = yearly_summary)
 
+#glm_superbloom <- logistf(S_y ~ year_obs_sum + peak_week + count_sd, data = yearly_summary)
+
 ## predict superblooms using this glm as our classification model
 yearly_summary <- yearly_summary %>% 
   mutate(S_y_hat_prob = predict(glm_superbloom, type = "response"), 
@@ -372,7 +375,48 @@ sim_data_weekly_z_inyear <- sb_data_weekly %>%
 
 # Find high quantity weekbins in the superbloom year
 sb_candidate_wk_bins <- filter(sim_data_weekly_z_inyear, z_score_in_year > 2)
+
 ```
+## Try to break deterministic link 
+```{r}
+set.seed(120)
+summary_binned <- simu_data %>%
+  group_by(year) %>%
+  sample_n(50) %>% # take only 50 days for each year
+  summarise(
+    year_obs_sum_raw = sum(obs_count),
+    peak_week = doy[which.max(obs_count)],
+    count_sd = sd(obs_count),
+    S_y = unique(S_y)
+  ) %>%
+  mutate(
+    year_obs_sum = year_obs_sum_raw + rnorm(n(), mean = 0, sd = 30),
+    obs_sum_category = cut(
+      year_obs_sum,
+      breaks = quantile(year_obs_sum, probs = c(0, 0.33, 0.66, 1), na.rm=TRUE),
+      labels = c("Low", "Medium", "High"),
+      include.lowest = TRUE
+    )
+  )
+
+fit_firth_cat <- logistf(
+  S_y ~ obs_sum_category + peak_week + count_sd,
+  data = summary_binned
+)
+summary(fit_firth_cat)
+
+summary_binned <- summary_binned %>% 
+  mutate(S_y_hat_prob = predict(fit_firth_cat, type = "response"), 
+         S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0))
+
+## create a confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+
+```
+
+
+
 ## Add a spatial component to the previous simu
 ```{r}
 # Define the function
@@ -485,7 +529,7 @@ sim.latent.w.det.spatial2 <- function(
 
 Run simulation
 ```{r}
-set.seed(782)
+set.seed(78)
 spatial_sim <- sim.latent.w.det.spatial2(n_years = 1000, pbloom = 0.2, grid_n = 2, dirichlet_conc = 5) # ngrid is 5x5 = 25 spatial cells
 
 # create a visual for comparison 
@@ -583,5 +627,970 @@ sim_data_weekly_z_inyear <- sb_data_weekly %>%
 
 # Find high quantity weekbins in the superbloom year
 sb_candidate_wk_bins <- filter(sim_data_weekly_z_inyear, z_score_in_year > 2)
+```
+Logic works so far, lets introduce some more sampling biases and issues. 
+1) Lets add a weekend bias, detection increases on weekends compared to the overall average. 
+```{r}
+# Define the function
+sim.latent.w.det.spatial.wkends <- function(
+  n_years = 30,
+  days = 1:150,
+  mu_peak = 100,
+  dur = 12,
+  y_var = 0,
+  alpha_0 = 9,
+  alpha_1 = 2.5,
+  pbloom = 0.2,
+  pdetwend = 0.8, # weekend detection probability 
+  pdetwday = 0.5, # weekday detection probability
+  grid_n = 5,
+  sdet = 0.6, # generalized all site detection probability 
+  dirichlet_conc = 1e6 # smaller = more uneven site abundances
+) {
+  # Temporal hyperparameters
+  mu_mu <- rnorm(1, mean = mu_peak, sd = 10)
+  sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5))
+  mu_sigma <- rnorm(1, mean = dur, sd = 3)
+  sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+
+  # Superbloom probability
+  calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(pshape1 = shape1, pshape2 = shape2)
+  }
+  bloom_params <- calibrate_bloom_beta(mean = pbloom)
+  p_bloom <- rbeta(1, shape1 = bloom_params$pshape1, shape2 = bloom_params$pshape2)
+
+  # Year-specific flowering parameters
+  mu_y <- rnorm(n_years, mean = mu_mu, sd = sigma_mu)
+  sigma_y <- abs(rnorm(n_years, mean = mu_sigma, sd = sigma_sigma))
+  S_y <- rbinom(n_years, 1, prob = p_bloom)
+  log_N_y <- alpha_0 + alpha_1 * S_y
+  N_y <- exp(log_N_y)
+  
+  # identify weekends
+  is_weekend <- function(doy){
+    weekday <- (doy - 1) %% 7 + 1
+    weekday %in% c(6,7)
+  }
+  weekend_flag <- is_weekend(days)
+  pdet_day <- ifelse(weekend_flag, pdetwend, pdetwday)
+
+  # Spatial grid
+  calibrate_beta <- function(mean, fixed_shape1 = 10) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(shape1 = shape1, shape2 = shape2)
+  }
+  beta_params <- calibrate_beta(mean = sdet, fixed_shape1 = 2) # adjust fixed shape here to increase detection heterogeneity
+  spatial_grid <- expand.grid(x = 1:grid_n, y = 1:grid_n) %>%
+    mutate(
+      cell_id = paste0("cell_", x, "_", y),
+      pdet = rbeta(n = n(), shape1 = beta_params$shape1, shape2 = beta_params$shape2)
+    )
+
+  n_cells <- nrow(spatial_grid)
+
+  # Generate data for each year
+  sim_obs <- purrr::map_dfr(1:n_years, function(y) {
+    # Daily expected abundance (density)
+    doy_density <- dnorm(days, mean = mu_y[y], sd = sigma_y[y])
+
+    # Dirichlet proportions across cells
+    prop_cells <- MCMCpack::rdirichlet(1, rep(dirichlet_conc, n_cells))[1,]
+
+    # For each cell
+    daily_results <- purrr::map_dfr(1:n_cells, function(i) {
+      cell <- spatial_grid[i, ]
+      prop_c <- prop_cells[i]
+      # Expected abundance curve for this cell
+      A_d_c <- N_y[y] * prop_c * doy_density
+      # Simulate counts
+      true_count <- rpois(length(A_d_c), lambda = A_d_c)
+      obs_count <- rbinom(length(A_d_c), size = true_count, prob = pdet_day)
+
+      tibble(
+        year = y,
+        doy = days,
+        true_count = true_count,
+        obs_count = obs_count,
+        abundance = A_d_c,
+        mu_y = mu_y[y],
+        sigma_y = sigma_y[y],
+        S_y = S_y[y],
+        N_y = N_y[y],
+        cell_id = cell$cell_id,
+        x = cell$x,
+        y = cell$y,
+        pdet_day = pdet_day,
+        prop_abundance = prop_c
+      )
+    })
+
+    # Compute total true count per year & doy
+    totals <- daily_results %>%
+      group_by(year, doy) %>%
+      summarize(
+        true_count_total = sum(true_count),
+        abundance_total = sum(abundance),
+        .groups = "drop"
+      )
+
+    # Join back
+    daily_results %>%
+      left_join(totals, by = c("year", "doy"))
+  })
+
+  return(sim_obs)
+}
+```
+
+Run simu 
+```{r}
+set.seed(78)
+spatial_sim <- sim.latent.w.det.spatial.wkends(n_years = 100, pbloom = 0.2, sdet = 0.6, pdetwday = 0.2, pdetwend = 0.5,  grid_n = 2, dirichlet_conc =0.01) # ngrid is 5x5 = 25 spatial cells
+
+# create a visual for comparison 
+spatial_sim %>%
+  filter(year %in% c(1)) %>%
+  ggplot() +
+  # geom_col(aes(x = doy, y = true_count, fill = factor(year)),
+  #          position = "identity", width = bin_width * 0.9, alpha = 0.1) +
+  geom_col(aes(x = doy, y = obs_count, fill = factor(cell_id)), 
+           position = "stack", alpha = 0.9) +
+  geom_line(aes(x = doy, y = abundance_total, color = factor(year), linetype = factor(S_y)), linewidth = 1) +
+  scale_linetype_manual(values = c("solid", "longdash"),
+                        labels = c("Normal", "Superbloom"),
+                        name = "Bloom type") +
+  labs(title = "Flowering Abundance vs Observed Counts \n With Superbloom Latent Indicator Parameter & Uniform Imperfect Detection Added \n Across Spatial Cells",
+       x = "Day of Year", y = "Count / Expected Abundance", color = "Year", fill = "Year") +
+  theme_minimal()
+```
+Try detecting it
+```{r}
+# pre-step, summarize the observation data into week (7 day) increments
+simu_data_weekly <- spatial_sim %>% 
+  mutate(
+    week = ceiling(doy/7)
+  ) %>% 
+  group_by(year, week, cell_id) %>% 
+  summarize(
+    obs_count_sum = sum(obs_count, na.rm = TRUE),
+    obs_count_mean = mean(obs_count, na.rm = TRUE), 
+    true_count_sum = sum(true_count, na.rm = TRUE), 
+    .groups = "drop", 
+    S_y = unique(S_y)
+  )
+# Stage 1) Use a glm to classify which years are superbloom years
+
+## summarize the year's information 
+yearly_summary <- simu_data_weekly %>% 
+  group_by(year, cell_id) %>% 
+  summarize(
+    year_obs_sum = sum(obs_count_sum), 
+    peak_week = week[which.max(obs_count_sum)], 
+    count_sd = sd(obs_count_sum), 
+    S_y = unique(S_y), 
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    cell_id = as.factor(cell_id)
+  )
+
+### scale 
+yearly_summary$year_obs_sum_z <- scale(yearly_summary$year_obs_sum)
+yearly_summary$peak_week_z <- scale(yearly_summary$peak_week)
+yearly_summary$count_sd_z <- scale(yearly_summary$count_sd)
+
+## run a glm predicting S_y (superbloom status) based on the summarized info
+glm_superbloom <- glmer(S_y ~ year_obs_sum_z + peak_week_z + count_sd_z + (1 | cell_id),
+                      family = "binomial", data = yearly_summary)
+
+## predict superblooms using this glm as our classification model
+yearly_summary <- yearly_summary %>% 
+  mutate(S_y_hat_prob = predict(glm_superbloom, type = "response"), 
+         S_y_hat = ifelse(S_y_hat_prob > 0.5, 1, 0))
+
+## create a confusion matrix 
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+
+# step 2) Use Z-scores across years that contained candidate superblooms to classify large observation windows
+
+## filter to only superbloom years (as identified by our predictive glm)
+candidate_superbloom_years <- yearly_summary %>% 
+  filter(S_y_hat == 1) %>% 
+  dplyr::select(year)
+candidate_superbloom_years <- unique(candidate_superbloom_years$year)
+
+## filter weekly binned data to just superbloom years, compute mean and sd per week across all superbloom years 
+# Aggregate daily observations into weekly sums
+sb_data_weekly <- spatial_sim %>%
+  mutate(
+    week = ceiling(doy / 7)
+  ) %>%
+  group_by(year, week, S_y, cell_id) %>%
+  summarize(
+    obs_count_sum = sum(obs_count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  filter(year %in% candidate_superbloom_years)
+
+# Compute year-specific mean and SD of weekly sums
+sim_data_weekly_z_inyear <- sb_data_weekly %>%
+  group_by(year) %>%
+  mutate(
+    year_mean = mean(obs_count_sum, na.rm = TRUE),
+    year_sd = sd(obs_count_sum, na.rm = TRUE),
+    z_score_in_year = (obs_count_sum - year_mean) / year_sd
+  ) %>%
+  ungroup()
+
+# Find high quantity weekbins in the superbloom year
+sb_candidate_wk_bins <- filter(sim_data_weekly_z_inyear, z_score_in_year > 2)
+```
+Note https://stackoverflow.com/questions/8596160/why-am-i-getting-algorithm-did-not-converge-and-fitted-prob-numerically-0-or For the warning about glm.fit. 
+Diagnose model fit
+```{r}
+# install.packages("devtools")
+#devtools::install_github("ikosmidis/detectseparation") # r is not available on CRAN, so we need to install from GitHub
+library(detectseparation)
+glm_sep <- glm(S_y ~ year_obs_sum + peak_week + count_sd + cell_id,
+                      family = "binomial", data = yearly_summary, method = "detect_separation")
+
+glm_sep
+```
+
+
+
+
+
+
+### Try using a background observation process
+Simulate background observations that are independent of flowering (includes all plant records, insects, blah blah blah)
+Make it where this background can vary over years (sampling effort), vary over doy (seasonal observer effort), and turn off or on a correlation with observer activity during superblooms (more observations during superblooms)
+
+Let, $B_{y,d}$ be the background counts in year $y$, day $d$
+     $R_{y,d}$ be the ObservedCounts_y,d + B_y_d = total observed records.
+
+We will then compute the proportion of flowering records as compared to the background observations.
+$$
+P_{y,d} = \frac{ObservedCounts_{y,d}}{R_{y,d}}
+$$
+Which will hopefully tell us something about the likelihood of a superbloom. 
+
+Main changes: 
+Model background counts as Poisson 
+$$
+B_{y,d} \sim \text{Poisson}(\lambda_{y,d})
+$$
+And allow the background to vary
+$$
+\lambda_{y,d} = exp(\beta_0 + \beta_1dnorm(d|\mu_y,\sigma_{b,g}) + \beta_2 S_y)
+$$
+Where $\beta_0$ is baseline log-intensity
+$\beta_1$ is the seasonal amplitude
+$\beta_2$ is the effect of the superblooms modulation on overall background obs
+
+Simulate
+```{r}
+sim.latent.with.background.dropout <- function(
+  n_years = 30,            # number of years
+  days = 1:365,            # DOY
+  mu_peak = 100,           # flowering peak
+  dur = 12,                # duration
+  y_var = 0,               # variability
+  alpha_0 = 9,             # base log abundance
+  alpha_1 = 2.5,           # superbloom log abundance
+  pbloom = 0.2,            # prob superbloom
+  pdet = 0.5,              # detection prob for flowering
+  beta_0 = 3,              # background log baseline
+  beta_1 = 0.5,            # background seasonality
+  beta_2 = 0.3,             # background superbloom boost
+  sigma_bg = 20,           # background variability
+  densityObservable = 10, # density required to observe records successfully
+  dropout_prob_densityD = 0.3       # probability of dropout in observation process, with density dependence.
+) {
+  # Temporal hyperparameters
+  mu_mu <- rnorm(1, mean = mu_peak, sd = 10)
+  sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5))
+  mu_sigma <- rnorm(1, mean = dur, sd = 3)
+  sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+  
+  # Probability of superbloom
+  calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(pshape1 = shape1, pshape2 = shape2)
+  }
+  bloom_params <- calibrate_bloom_beta(pbloom)
+  p_bloom <- rbeta(1, bloom_params$pshape1, bloom_params$pshape2)
+  
+  # Year-specific parameters
+  mu_y <- rnorm(n_years, mu_mu, sigma_mu)
+  sigma_y <- abs(rnorm(n_years, mu_sigma, sigma_sigma))
+  S_y <- rbinom(n_years, 1, p_bloom)
+  log_N_y <- alpha_0 + alpha_1 * S_y
+  N_y <- exp(log_N_y)
+  
+  # Detection variability
+  calibrate_beta <- function(mean, fixed_shape1 = 10) {
+    shape2 <- fixed_shape1 * (1 - mean) / mean
+    list(shape1 = fixed_shape1, shape2 = shape2)
+  }
+  beta_params <- calibrate_beta(pdet)
+  pdet_y <- rbeta(n_years, beta_params$shape1, beta_params$shape2)
+
+  # Simulate
+  purrr::map_dfr(1:n_years, function(y) {
+    doy_density <- dnorm(days, mu_y[y], sigma_y[y])
+    A_yd <- N_y[y] * doy_density
+    true_count <- rpois(length(A_yd), A_yd)
+    obs_count <- rbinom(length(true_count), true_count, pdet_y[y])
+    
+    # randomly zero out some flowering observations (with density dependence)
+    dropout_prob <- ifelse(obs_count <= densityObservable, 0.5, dropout_prob_densityD)
+    mask <- rbinom(length(obs_count), size =1, prob = 1 - dropout_prob)
+    obs_count <- obs_count * mask
+
+    # Background counts
+lambda_bg <- exp(
+  beta_0 +
+  beta_1 * 100 * dnorm(days, mean = mu_y[y], sd = sigma_bg) + # 100 is there as a scaling parameter (otherwise we need to input huge numbers for beta_1)
+  beta_2 * S_y[y]
+)
+    bg_count <- rpois(length(lambda_bg), lambda_bg)
+
+    total_obs <- obs_count + bg_count
+
+    tibble(
+      year = y,
+      doy = days,
+      S_y = S_y[y],
+      mu_y = mu_y[y],
+      sigma_y = sigma_y[y],
+      N_y = N_y[y],
+      abundance = A_yd,
+      true_flowering_count = true_count,
+      flowering_obs = obs_count,
+      background_obs = bg_count,
+      total_obs = total_obs,
+      prop_flowering = ifelse(total_obs > 0, obs_count / total_obs, 0)
+    )
+  })
+}
+```
+
+```{r}
+
+sim_w_background <- sim.latent.with.background.dropout(
+  n_years = 30,
+  days = 1:150,
+  mu_peak = 100,
+  dur = 12,
+  y_var = 10,
+  alpha_0 = 7,
+  alpha_1 = 0.1,
+  pbloom = 0.2,
+  pdet = 0.5,
+  beta_0 = 3,
+  beta_1 = 1,
+  beta_2 = 0.3, 
+  dropout_prob_densityD = 0.8)
+
+# Visualize selected years
+superbloom_y <- filter(sim_w_background, S_y == 1) %>% pull(year) %>% unique()
+superbloom_y <- superbloom_y[1]
+nonsuperbloom_y <- filter(sim_w_background, S_y == 0) %>% pull(year) %>% unique()
+nonsuperbloom_y <- nonsuperbloom_y[1]
+sim_w_background %>%
+  filter(year %in% c(superbloom_y, nonsuperbloom_y)) %>%
+  ggplot() +
+  # Background counts as transparent gray bars
+  geom_col(
+    aes(x = doy, y = background_obs, group = factor(year)),
+    fill = "gray70",
+    alpha = 0.3,
+    position = "identity",
+    width = 1
+  ) +
+  # Flowering counts as transparent colored bars on top
+  geom_col(
+    aes(x = doy, y = flowering_obs, fill = factor(year)),
+    alpha = 0.4,
+    position = "identity",
+    width = 1
+  ) +
+  # Expected abundance curve (latent flowering abundance)
+  geom_line(
+    aes(x = doy, y = abundance, color = factor(year), linetype = factor(S_y)),
+    linewidth = 1
+  ) +
+  scale_linetype_manual(
+    values = c("solid", "longdash"),
+    labels = c("Normal", "Superbloom"),
+    name = "Bloom Type"
+  ) +
+  labs(
+    title = "Flowering Abundance, Flowering Observed Counts, and Background Observations",
+    subtitle = "Bars: Flowering counts over background counts\nLines: Expected flowering abundance curve",
+    x = "Day of Year",
+    y = "Counts / Expected Abundance",
+    color = "Year",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+Use a glm to predict a superbloom year
+```{r}
+
+# summarize info 
+simu_data_weekly <- sim_w_background %>% 
+  mutate(
+    week = ceiling(doy/7)
+  ) %>% 
+  group_by(year, week, S_y) %>% 
+  summarize(
+    flowering_obs_count_sum = sum(flowering_obs, na.rm = TRUE),
+    flowering_obs_count_mean = mean(flowering_obs, na.rm = TRUE), 
+    true_flowering_count_sum = sum(true_flowering_count, na.rm = TRUE),
+    background_obs_count_sum = sum(background_obs, na.rm = TRUE), 
+    background_obs_count_mean = mean(background_obs, na.rm = TRUE), 
+    total_obs_count_sum = sum(total_obs, na.rm = TRUE),
+    total_obs_mean = mean(total_obs, na.rm = TRUE),
+    mean_prop_flowering = mean(prop_flowering, na.rm = TRUE),
+  .groups = "drop"
+  )
+
+## summarize the year's information 
+yearly_summary <- simu_data_weekly %>% 
+  group_by(year) %>% 
+  summarize(
+    year_flowering_obs_sum = sum(flowering_obs_count_sum), 
+    peak_flowering_week = week[which.max(flowering_obs_count_sum)], 
+    flowering_count_sd = sd(flowering_obs_count_sum),
+    year_background_obs_sum = sum(background_obs_count_sum), 
+    peak_background_week = week[which.max(background_obs_count_sum)],
+    background_count_sd = sd(background_obs_count_sum),
+    year_total_obs_sum = sum(total_obs_count_sum),
+    peak_total_obs_week = week[which.max(total_obs_count_sum)],
+    total_obs_sd = sd(total_obs_count_sum),
+    mean_prop_flowering = mean(mean_prop_flowering, na.rm = TRUE),
+    S_y = unique(S_y), 
+    .groups = "drop"
+  )
+
+glm_superbloom <- glm(
+  S_y ~ year_flowering_obs_sum + year_background_obs_sum + mean_prop_flowering,
+  data = yearly_summary,
+  family = binomial()
+)
+
+### Try to deal with over fitting (result of simulation being too deterministic)
+# scale 
+# yearly_summary <- yearly_summary %>%
+#   mutate(flowering_z = scale(year_flowering_obs_sum),
+#          background_z = scale(year_background_obs_sum))
+# 
+# firth_fit <- logistf(
+#   S_y ~ flowering_z + background_z + mean_prop_flowering,
+#   data = yearly_summary,
+#   control = logistf.control(maxit = 200, maxstep = 5)
+# )
+
+summary(glm_superbloom)
+
+yearly_summary$predicted_prob_superbloom <- predict(glm_superbloom, type = "response")
+
+yearly_summary$S_y_hat <- ifelse(yearly_summary$predicted_prob_superbloom > 0.5, 1, 0)
+
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+```
+Add spatial component to the simulation
+```{r}
+sim.latent.with.background.spatial.weekend.dropout <- function(
+  n_years = 30,
+  days = 1:365,
+  mu_peak = 100,
+  dur = 12,
+  y_var = 0,
+  alpha_0 = 9,
+  alpha_1 = 2.5,
+  pbloom = 0.2,
+  pdetwend = 0.8,
+  pdetwday = 0.5,
+  beta_0 = 3,
+  beta_1 = 0.5,
+  beta_2 = 0.3,
+  sigma_bg = 20,
+  densityObservable = 10,
+  dropout_prob_densityD = 0.3,
+  grid_n = 5,
+  sdet = 0.6,
+  dirichlet_conc = 1e6, 
+  bAbd_scaler = 0.2
+) {
+  # Temporal hyperparameters
+  mu_mu <- rnorm(1, mean = mu_peak, sd = 10)
+  sigma_mu <- abs(rnorm(1, mean = y_var, sd = 5))
+  mu_sigma <- rnorm(1, mean = dur, sd = 3)
+  sigma_sigma <- abs(rnorm(1, mean = 0, sd = 3))
+  
+  # Superbloom probability
+  calibrate_bloom_beta <- function(mean, fixed_shape1 = 2) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(pshape1 = shape1, pshape2 = shape2)
+  }
+  bloom_params <- calibrate_bloom_beta(pbloom)
+  p_bloom <- rbeta(1, bloom_params$pshape1, bloom_params$pshape2)
+  
+  # Year-specific flowering parameters
+  mu_y <- rnorm(n_years, mu_mu, sigma_mu)
+  sigma_y <- abs(rnorm(n_years, mu_sigma, sigma_sigma))
+  S_y <- rbinom(n_years, 1, p_bloom)
+  log_N_y <- alpha_0 + alpha_1 * S_y
+  N_y <- exp(log_N_y)
+  
+  # Spatial detection heterogeneity
+  calibrate_beta <- function(mean, fixed_shape1 = 10) {
+    shape1 <- fixed_shape1
+    shape2 <- shape1 * (1 - mean) / mean
+    list(shape1 = shape1, shape2 = shape2)
+  }
+  beta_params <- calibrate_beta(sdet, fixed_shape1 = 2)
+  spatial_grid <- expand.grid(x = 1:grid_n, y = 1:grid_n) %>%
+    mutate(
+      cell_id = paste0("cell_", x, "_", y),
+      pdet_spatial = rbeta(n(), beta_params$shape1, beta_params$shape2)
+    )
+  n_cells <- nrow(spatial_grid)
+  
+  # Weekday/weekend detection
+  is_weekend <- function(doy) {
+    weekday <- (doy - 1) %% 7 + 1
+    weekday %in% c(6,7)
+  }
+  weekend_flag <- is_weekend(days)
+  pdet_day_vec <- ifelse(weekend_flag, pdetwend, pdetwday)
+  
+  # Generate data for each year
+  sim_obs <- purrr::map_dfr(1:n_years, function(y) {
+    doy_density <- dnorm(days, mu_y[y], sigma_y[y])
+    
+    # Dirichlet proportions across cells
+    prop_cells <- MCMCpack::rdirichlet(1, rep(dirichlet_conc, n_cells))[1,]
+    
+    # for each cell
+    daily_results <- purrr::map_dfr(1:n_cells, function(i) {
+      cell <- spatial_grid[i,]
+      prop_c <- prop_cells[i]
+      
+      # Expected flowering abundance
+      A_d_c <- N_y[y] * prop_c * doy_density
+      true_flowering <- rpois(length(A_d_c), A_d_c)
+      
+      # Observation probability (weekday/weekend * spatial)
+      pdet_day_cell <- pdet_day_vec * cell$pdet_spatial
+      obs_flowering <- rbinom(length(A_d_c), size = true_flowering, prob = pdet_day_cell)
+      
+      # Randomly zero out some counts (density-dependent dropout)
+      dropout_prob <- ifelse(obs_flowering <= densityObservable, 0.5, dropout_prob_densityD)
+      mask <- rbinom(length(obs_flowering), size=1, prob=1 - dropout_prob)
+      obs_flowering <- obs_flowering * mask
+      
+    
+      
+      # Background abundance (same across all cells for simplicity)
+      baseline_bg <- exp(
+        beta_0 +
+        beta_1 * 100 * dnorm(days, mu_y[y], sigma_bg) +
+        beta_2 * S_y[y]
+      ) 
+      
+      # scale A_d_c to match the magnitude of baseline_bg 
+      lambda_bg <- baseline_bg + bAbd_scaler * A_d_c
+      bg_counts <- rpois(length(lambda_bg), lambda_bg)
+      
+      # Combine counts
+      total_obs <- obs_flowering + bg_counts
+      
+      tibble(
+        year = y,
+        doy = days,
+        S_y = S_y[y],
+        mu_y = mu_y[y],
+        sigma_y = sigma_y[y],
+        N_y = N_y[y],
+        abundance = A_d_c,
+        true_flowering = true_flowering,
+        flowering_obs = obs_flowering,
+        background_obs = bg_counts,
+        total_obs = total_obs,
+        prop_flowering = ifelse(total_obs > 0, obs_flowering/total_obs, 0),
+        x = cell$x,
+        y = cell$y,
+        cell_id = cell$cell_id,
+        pdet_day = pdet_day_cell,
+        prop_abundance = prop_c
+      )
+    })
+     # Compute total true count per year & doy
+    totals <- daily_results %>%
+      group_by(year, doy) %>%
+      summarize(
+        true_flowering_total = sum(true_flowering),
+        abundance_total = sum(abundance),
+        .groups = "drop"
+      )
+
+    # Join back
+    daily_results %>%
+      left_join(totals, by = c("year", "doy"))
+
+  })
+  return(sim_obs)
+  
+}
+```
+
+Simulate data
+```{r}
+source("/home/jt-miller/Gurlab/SuperBlooms/draft-code/simulation-script.R")
+set.seed(203)
+sim_w_background_w_spatial <- sim.latent.with.background.spatial.weekend.dropout(
+  n_years = 10, # num of years to simu
+  days = 1:150, # interval of days to simulate
+  mu_peak = 100, # general peak per year
+  dur = 12, # general duration of flowering
+  y_var = 10, # variability between years
+  alpha_0 = 9, # the underlying abundance of flowering plants regardless of the year
+  alpha_1 = 1, # the multiplicitive increase in flowering abundance due to superbloom, 2.5x currently 
+  pbloom = 0.2, # the probability of a superbloom
+  pdetwend = 0.5, # the probability of detection given that the day is a weekend 
+  pdetwday = 0.2, # the probability of detection given that the day is a weekday
+  min_det = 0.15, # the probability of detection for early years in the simulation
+  max_det = 0.6, # the probability of detection for later years in the simulation
+  grid_n = 5, # the number of grid cells (5x5)
+  sdet = 0.7, # the site detection probability (only used if equal_site_detection = TRUE)
+  dirichlet_conc = 10, # the concentration parameter for sites, high number (1e6) means sites will be more similar, low number means sites will be more dissimilar (10)
+  small_constant = 2, # # intial value for background abundance
+  bAbd_scaler = 1.5, # scaling factor for background abundance 
+  equal_site_detection = FALSE, # whether or not to use equal site detection probability, if FALSE use high_sdet and low_sdet
+  high_sdet = 0.8, # high detection probability for some cells
+  low_sdet = 0.3, # low detection probability for some cells
+  prop_high_sdet = 0.5, # fraction of high detection cells (half in this case)
+  densityBasedMask = TRUE, # whether to use density-based dropout masking
+  beta0 = -1.5, # the baseline log-odds of retention when observed counts = 0, and detection prob = 0, making this number more negative will make masking more likely everywhere
+  beta1 = 1.2, # sensitivity of retention to observations made, (keep >0 to ensure that more )
+  beta2 = 1.0, # how strongly retention is related to underlying detection prob pdet_total (0 means no relationship)
+  plot_detection_trend = TRUE,
+  plot_spatial_hotspots = TRUE,
+  plot_dropout_surface = TRUE)
+
+# Visualize selected years
+superbloom_y <- filter(sim_w_background_w_spatial, S_y == 1) %>% pull(year) %>% unique()
+superbloom_y <- max(superbloom_y)
+test_y <- filter(sim_w_background_w_spatial, year == superbloom_y)
+mean_doy <- round(max(test_y$mu_y), 0)
+test <- filter(sim_w_background_w_spatial, year == superbloom_y & doy == mean_doy)
+test %>% summarize(corr = cor(true_flowering, obs_background_count))
+nonsuperbloom_y <- filter(sim_w_background_w_spatial, S_y == 0) %>% pull(year) %>% unique()
+nonsuperbloom_y <- max(nonsuperbloom_y)
+selected_years <- c(superbloom_y, nonsuperbloom_y)
+sim_w_background_w_spatial %>%
+  filter(year %in% selected_years) %>%
+  ggplot() +
+  # Background counts always in gray
+  geom_col(
+    aes(x = doy, y = obs_background_count),
+    fill = "gray50",
+    alpha = 0.8,
+    position = "stack",
+    width = 1
+  ) +
+  geom_col(
+    aes(x = doy, y = true_background_count),
+    fill = "gray90",
+    alpha = 0.8,
+    position = "stack",
+    width = 1
+  ) +
+  # Flowering counts colored by Year x Cell
+# Base fill
+geom_col(
+  aes(
+    x = doy,
+    y = flowering_obs,
+    fill = interaction(factor(year), factor(cell_id))
+  ),
+  alpha = 0.4,
+  position = "stack",
+  width = 1
+) +
+# Outline for superbloom
+geom_col(
+  data = . %>% filter(S_y == 1),
+  aes(
+    x = doy,
+    y = flowering_obs,
+    group = interaction(year, cell_id)
+  ),
+  fill = NA,
+  color = "black",
+  position = "stack",
+  width = 1,
+  linewidth = 0.3
+) +
+  # Expected abundance
+  geom_line(
+    aes(x = doy, y = abundance_total, color = interaction(factor(year), factor(cell_id)), linetype = factor(S_y)),
+    linewidth = 1
+  ) +
+  scale_linetype_manual(
+    values = c("solid", "longdash"),
+    labels = c("Normal", "Superbloom"),
+    name = "Bloom Type"
+  ) +
+  labs(
+    title = "Flowering Abundance, Observed Counts, and Background Observations",
+    subtitle = "Overlay of Two Years",
+    x = "Day of Year",
+    y = "Counts / Expected Abundance",
+    color = "Year × Cell",
+    fill = "Year × Cell"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  ) + 
+  facet_wrap(~S_y, labeller = labeller(S_y = c(`0` = "Normal Year", `1` = "Superbloom Year"))) +
+  guides(fill = "none")
+  
+
+
+```
+```{r}
+sim_w_background_w_spatial %>%
+  filter(year %in% selected_years) %>%
+  ggplot() +
+    # Background counts always in gray
+  geom_col(
+    aes(x = doy, y = obs_background_count),
+    fill = "gray50",
+    alpha = 0.8,
+    position = "stack",
+    width = 1
+  ) +
+  geom_col(
+    aes(x = doy, y = true_background_count),
+    fill = "gray90",
+    alpha = 0.8,
+    position = "stack",
+    width = 1
+  ) +
+  # Flowering counts colored by Cell only
+geom_col(
+  aes(
+    x = doy,
+    y = flowering_obs,
+    
+    fill = factor(cell_id)
+  ),
+  alpha = 0.4,
+  position = "stack",
+  width = 1
+) +
+# Expected abundance lines colored by Year only
+geom_line(
+  aes(
+    x = doy,
+    y = abundance_total,
+    color = factor(year),
+    linetype = factor(S_y)
+  ),
+  linewidth = 1
+) +
+scale_linetype_manual(
+  values = c("solid", "longdash"),
+  labels = c("Normal", "Superbloom"),
+  name = "Bloom Type"
+) +
+labs(
+  title = "Flowering Abundance, Observed Counts, and Background Observations",
+  subtitle = "Overlay of Two Years",
+  x = "Day of Year",
+  y = "Counts / Expected Abundance",
+  color = "Year",
+  fill = "Cell"
+) +
+guides(fill = "none") +   # this will now work because fill and color are decoupled
+theme_minimal() +
+theme(
+  panel.grid.minor = element_blank(),
+  legend.position = "bottom"
+) +
+facet_wrap(
+  ~S_y,
+  labeller = labeller(S_y = c(`0` = "Normal Year", `1` = "Superbloom Year"))
+)
+```
+
+
+
+Run the model 
+```{r}
+# summarize info 
+sim_w_background_w_spatial_weekly <- sim_w_background_w_spatial %>% 
+  mutate(
+    week = ceiling(doy/7)
+  ) %>% 
+  group_by(year, week, S_y, cell_id) %>% 
+  summarize(
+    # flowering_obs_count_sum = sum(flowering_obs, na.rm = TRUE),
+    # flowering_obs_count_mean = mean(flowering_obs, na.rm = TRUE), 
+    # true_flowering_count_sum = sum(true_flowering, na.rm = TRUE),
+    # background_obs_count_sum = sum(obs_background_count, na.rm = TRUE), 
+    # background_obs_count_mean = mean(obs_background_count, na.rm = TRUE), 
+    # total_obs_count_sum = sum(total_observed_count, na.rm = TRUE),
+    # total_obs_mean = mean(total_observed_count, na.rm = TRUE),
+    # mean_prop_flowering = mean(prop_observed_count_flowering, na.rm = TRUE),
+    flowering_obs_weekly_sum = sum(flowering_obs, na.rm = TRUE),
+    background_obs_weekly_sum = sum(obs_background_count, na.rm = TRUE),
+    total_obs_weekly_sum = sum(total_observed_count, na.rm = TRUE),
+    mean_prop_flowering = mean(prop_observed_count_flowering, na.rm = TRUE),
+  .groups = "drop"
+  )
+
+## summarize the year's information 
+yearly_summary <- sim_w_background_w_spatial_weekly %>% 
+  group_by(year, cell_id) %>% 
+  summarize(
+    year_flowering_obs_sum = sum(flowering_obs_weekly_sum), 
+    peak_flowering_week = week[which.max(flowering_obs_weekly_sum)], 
+    flowering_count_sd = sd(flowering_obs_weekly_sum),
+    year_background_obs_sum = sum(background_obs_weekly_sum), 
+    peak_background_week = week[which.max(background_obs_weekly_sum)],
+    background_count_sd = sd(background_obs_weekly_sum),
+    year_total_obs_sum = sum(total_obs_weekly_sum),
+    peak_total_obs_week = week[which.max(total_obs_weekly_sum)],
+    total_obs_sd = sd(total_obs_weekly_sum),
+    mean_prop_flowering = mean(mean_prop_flowering, na.rm = TRUE),
+    S_y = unique(S_y), 
+    .groups = "drop"
+  )
+
+## scale our predictors
+yearly_summary <- yearly_summary %>% 
+  mutate(
+    year_flowering_obs_sum_scaled = scale(year_flowering_obs_sum),
+    year_background_obs_sum_scaled = scale(year_background_obs_sum),
+    mean_prop_flowering_scaled = scale(mean_prop_flowering)
+  ) 
+  
+
+library(lme4)
+
+glm_superbloom <- glmer(
+  S_y ~ year_flowering_obs_sum_scaled + mean_prop_flowering_scaled + year_background_obs_sum_scaled + (1|cell_id),
+  data = yearly_summary,
+  family = binomial()
+)
+
+### Try to deal with over fitting (result of simulation being too deterministic)
+# scale 
+# yearly_summary <- yearly_summary %>%
+#   mutate(flowering_z = scale(year_flowering_obs_sum),
+#          background_z = scale(year_background_obs_sum))
+# 
+# firth_fit <- logistf(
+#   S_y ~ flowering_z + background_z + mean_prop_flowering,
+#   data = yearly_summary,
+#   control = logistf.control(maxit = 200, maxstep = 5)
+# )
+
+summary(glm_superbloom)
+
+yearly_summary$predicted_prob_superbloom <- predict(glm_superbloom, type = "response")
+
+yearly_summary$S_y_hat <- ifelse(yearly_summary$predicted_prob_superbloom > 0.5, 1, 0)
+
+confusion_matrix <- table(True = yearly_summary$S_y, Predicted = yearly_summary$S_y_hat)
+print(confusion_matrix)
+```
+
+Try doing a glm on weekly data?
+```{r}
+
+glm_weekly <- glmer(
+  S_y ~ mean_prop_flowering + (1 | year) + (1 | cell_id),
+  data = sim_w_background_w_spatial_weekly,
+  family = binomial(),
+  control = glmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 10000))
+)
+
+weekly_allfits <- allFit(glm_weekly)
+
+summary(glm_weekly)
+
+# Compute per-row fitted probabilities
+sim_w_background_w_spatial_weekly$pred_prob <- predict(glm_weekly, type = "response")
+
+# Aggregate per year: mean probability of superbloom
+year_preds <- sim_w_background_w_spatial_weekly %>%
+  group_by(year) %>%
+  summarise(
+    mean_prob = mean(pred_prob, na.rm = TRUE),
+    max_prob = max(pred_prob, na.rm = TRUE),
+    n_weeks = n(),
+    true_S_y = unique(S_y)  # assumes S_y constant within year
+  )
+
+# Decide threshold for classification
+threshold <- 0.5
+
+# Create predicted labels
+year_preds <- year_preds %>%
+  mutate(
+    predicted_S_y = ifelse(mean_prob > threshold, 1, 0)
+  )
+
+# Print prediction table
+print(year_preds)
+
+# Generate confusion matrix
+confusion_matrix <- table(True = year_preds$true_S_y,
+                          Predicted = year_preds$predicted_S_y)
+
+print(confusion_matrix)
+
+
+```
+After predicted S_y, lets construct a z-score assessment on those candidate years to pull out week-cell combinations that show large deviations from the normal trend 
+```{r}
+candidate_superbloom_years <- filter(year_preds, predicted_S_y == 1)$year
+sb_data_weekly <- sim_w_background_w_spatial_weekly %>%
+  filter(year %in% candidate_superbloom_years)
+
+# Compute year-cell specific mean and SD of weekly sums
+sim_data_weekly_z_inyear <- sb_data_weekly %>%
+  group_by(year, cell_id) %>%
+  mutate(
+    year_mean = mean(flowering_obs_weekly_sum, na.rm = TRUE),
+    year_sd = sd(flowering_obs_weekly_sum, na.rm = TRUE),
+    z_score_in_year_cell = (flowering_obs_weekly_sum - year_mean) / year_sd
+  ) %>%
+  ungroup()
+
+# Find high quantity weekbins in the superbloom year
+sb_candidate_wk_bins <- filter(sim_data_weekly_z_inyear, z_score_in_year_cell > 2)
 ```
 
