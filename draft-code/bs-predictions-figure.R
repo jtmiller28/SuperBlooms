@@ -129,50 +129,38 @@ surface(pred_vals)
 # Check if any values fall in your isomin:isomax range
 range(pred_vals, na.rm = TRUE)
 
-## So far the best one: 
 library(fields)
-
 X <- as.matrix(accuracy_summary[, c("pdet_day_avg", "pdet_year_avg", "pdet_spatial_avg")])
 y <- accuracy_summary$accuracy
 tps_model <- Tps(X, y)
-
-# Create grid for the two axes you want to plot
 gx <- seq(min(X[,1]), max(X[,1]), length = 50)
 gy <- seq(min(X[,2]), max(X[,2]), length = 50)
-
-# Choose a value for pdet_spatial_avg (slice location)
-slice_spatial <- 0.5  # Or median(X[,3]), or any value in range
-
-# Build grid for all combos at this spatial value
 grid2d <- expand.grid(
   pdet_day_avg = gx,
   pdet_year_avg = gy
 )
-grid2d$pdet_spatial_avg <- slice_spatial
 
-pred <- predict(tps_model, as.matrix(grid2d))
-
-# Reformat for surface or image plot
-z_matrix <- matrix(pred, nrow = length(gx), ncol = length(gy))
-
-# Now plot the slice
-filled.contour(
-  gx, gy, z_matrix,
-  color.palette = terrain.colors,
-  plot.title = title(
-    main = paste("Accuracy Surface at pdet_spatial_avg =", slice_spatial),
-    xlab = "pdet_day_avg",
-    ylab = "pdet_year_avg"
-  ),
-  key.title = title(main = "accuracy")
-)
-
-for (s in seq(0, 1, by = 0.2)) {
+# Step 1: Find the global min/max for all slices you intend to plot
+slice_seq <- seq(0, 1, by = 0.2)
+pred_matrix <- sapply(slice_seq, function(s) {
   grid2d$pdet_spatial_avg <- s
-  pred <- predict(tps_model, as.matrix(grid2d))
-  z_matrix <- matrix(pred, nrow = length(gx), ncol = length(gy))
+  predict(tps_model, as.matrix(grid2d))
+})
+global_min <- min(pred_matrix, na.rm=TRUE)
+global_max <- max(pred_matrix, na.rm=TRUE)
+
+# Step 2: When plotting, use `zlim = c(global_min, global_max)`
+for (i in seq_along(slice_seq)) {
+  s <- slice_seq[i]
+  z_matrix <- matrix(pred_matrix[,i], nrow = length(gx), ncol = length(gy))
   filled.contour(
     gx, gy, z_matrix,
-    plot.title = title(main = paste("Slice at pdet_spatial_avg =", round(s,2)))
+    zlim = c(global_min, global_max),
+    plot.title = title(
+      main = paste("Accuracy Surface at pdet_spatial_avg =", round(s,2)),
+      xlab = "pdet_day_avg",
+      ylab = "pdet_year_avg"
+    ),
+    key.title = title(main = "accuracy")
   )
 }
